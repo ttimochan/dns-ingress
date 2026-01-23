@@ -44,7 +44,9 @@ impl App {
 
     fn preload_certificates(&self) {
         if self.config.tls.default.is_none() && self.config.tls.certs.is_empty() {
-            warn!("No TLS certificates configured, TLS handshake will fail for incoming connections");
+            warn!(
+                "No TLS certificates configured, TLS handshake will fail for incoming connections"
+            );
             return;
         }
 
@@ -79,26 +81,29 @@ impl App {
     }
 
     pub async fn wait_for_shutdown(&mut self) {
-        info!("Waiting for all servers to shutdown...");
+        info!("Waiting for shutdown signal...");
 
-        let mut remaining = self.handles.len();
-        while remaining > 0 {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.handles.remove(0)
-            ).await;
+        info!("Waiting for all servers to close (max 10 seconds per server)...");
 
-            match result {
-                Ok(_) => {
-                    remaining -= 1;
-                    if remaining > 0 {
-                        info!("{} server(s) remaining...", remaining);
+        let total_servers = self.handles.len();
+        let mut completed = 0;
+
+        while completed < total_servers {
+            if let Some(handle) = self.handles.pop() {
+                let timeout = tokio::time::timeout(std::time::Duration::from_secs(10), handle);
+                let result = timeout.await;
+                match result {
+                    Ok(_) => {
+                        completed += 1;
+                        info!("Server closed ({}/{})", completed, total_servers);
+                    }
+                    Err(_) => {
+                        warn!("Timeout waiting for server to close, forcing...");
+                        completed += 1;
                     }
                 }
-                Err(_) => {
-                    warn!("Timeout waiting for server shutdown, forcing close...");
-                    break;
-                }
+            } else {
+                break;
             }
         }
 
