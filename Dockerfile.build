@@ -1,11 +1,27 @@
 FROM rust:1 AS builder
 
+# Install cross-compilation tools for arm64
+RUN apt-get update && apt-get install -y \
+    gcc-aarch64-linux-gnu \
+    g++-aarch64-linux-gnu \
+    binutils-aarch64-linux-gnu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add arm64 target to Rust
+RUN rustup target add aarch64-unknown-linux-gnu
+
 WORKDIR /app
 
 COPY . .
 
-RUN cargo build --release
+# Build for amd64
+RUN cargo build --release --target x86_64-unknown-linux-gnu
+
+# Build for arm64 with linker specified
+RUN CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    cargo build --release --target aarch64-unknown-linux-gnu
 
 FROM scratch
 
-COPY --from=builder /app/target/release/dns-ingress /dns-ingress
+COPY --from=builder /app/target/x86_64-unknown-linux-gnu/release/dns-ingress /dns-ingress-amd64
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/dns-ingress /dns-ingress-arm64
