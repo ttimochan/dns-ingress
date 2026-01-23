@@ -9,10 +9,11 @@ WORKSPACE=${GITHUB_WORKSPACE:-$(pwd)}
 echo "Workspace: $WORKSPACE"
 echo "Target: $TARGET"
 echo "Version: $VERSION"
+echo "Binary path: $WORKSPACE/target/$TARGET/release/dns-ingress"
 
 mkdir -p rpmbuild/SPECS
 
-# Create spec file with correct paths
+# Create spec file
 cat > rpmbuild/SPECS/dns-ingress.spec <<'EOFSPEC'
 Name:           dns-ingress
 Version:        VERSION_PLACEHOLDER
@@ -29,7 +30,7 @@ A high-performance DNS proxy server supporting DoT, DoH, DoQ, and DoH3 protocols
 mkdir -p %{buildroot}/usr/bin
 mkdir -p %{buildroot}/etc/dns-ingress
 mkdir -p %{buildroot}/usr/lib/systemd/system
-cp SOURCE_PATH/dns-ingress %{buildroot}/usr/bin/
+cp BINARY_PATH/dns-ingress %{buildroot}/usr/bin/
 
 cat > %{buildroot}/usr/lib/systemd/system/dns-ingress.service <<'SERVICE'
 [Unit]
@@ -62,10 +63,16 @@ EOFSPEC
 # Replace placeholders
 sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" rpmbuild/SPECS/dns-ingress.spec
 sed -i "s/TARGET_PLACEHOLDER/$(echo $TARGET | cut -d'-' -f1)/g" rpmbuild/SPECS/dns-ingress.spec
-sed -i "s|SOURCE_PATH|$WORKSPACE|g" rpmbuild/SPECS/dns-ingress.spec
+sed -i "s|BINARY_PATH|$WORKSPACE/target/$TARGET/release|g" rpmbuild/SPECS/dns-ingress.spec
+
+# Initialize RPM database
+HOME=/root rpm --initdb --dbpath /root/.rpmdb 2>/dev/null || true
 
 # Build RPM
-HOME=/root rpmbuild -bb rpmbuild/SPECS/dns-ingress.spec --define "_topdir $WORKSPACE/rpmbuild"
+HOME=/root rpmbuild -bb rpmbuild/SPECS/dns-ingress.spec \
+  --define "_topdir $WORKSPACE/rpmbuild" \
+  --define "_rpmdbpath /root/.rpmdb"
+
 find rpmbuild/RPMS -name "*.rpm" -exec cp {} dist/ \;
 
 echo "Created RPM packages in dist/"
