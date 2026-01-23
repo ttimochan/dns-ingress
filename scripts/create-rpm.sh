@@ -3,13 +3,9 @@ set -e
 
 ARCH=$1
 TARGET=$2
-VERSION=$3
+BINARY_PATH=$3
+VERSION=$4
 WORKSPACE=${GITHUB_WORKSPACE:-$(pwd)}
-
-echo "Workspace: $WORKSPACE"
-echo "Target: $TARGET"
-echo "Version: $VERSION"
-echo "Binary path: $WORKSPACE/target/$TARGET/release/dns-ingress"
 
 mkdir -p rpmbuild/SPECS
 
@@ -63,7 +59,7 @@ EOFSPEC
 # Replace placeholders
 sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" rpmbuild/SPECS/dns-ingress.spec
 sed -i "s/TARGET_PLACEHOLDER/$(echo $TARGET | cut -d'-' -f1)/g" rpmbuild/SPECS/dns-ingress.spec
-sed -i "s|BINARY_PATH|$WORKSPACE/target/$TARGET/release|g" rpmbuild/SPECS/dns-ingress.spec
+sed -i "s|BINARY_PATH|$BINARY_PATH|g" rpmbuild/SPECS/dns-ingress.spec
 
 # Initialize RPM database
 HOME=/root rpm --initdb --dbpath /root/.rpmdb 2>/dev/null || true

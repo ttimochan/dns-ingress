@@ -22,38 +22,36 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          cache: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Build amd64
-        run: cargo build --release --locked
-
-      - name: Build arm64
+      - name: Build amd64 binary
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          cargo build --release --locked --target aarch64-unknown-linux-gnu
+          docker buildx build --platform linux/amd64 -f Dockerfile.build -o type=local,dest=build-amd64 .
+          mkdir -p dist
+          cp build-amd64/dns-ingress dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64
 
-      - name: Create dist directory
-        run: mkdir -p dist
+      - name: Build arm64 binary
+        run: |
+          docker buildx build --platform linux/arm64 -f Dockerfile.build -o type=local,dest=build-arm64 .
+          cp build-arm64/dns-ingress dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64
 
       - name: Create Debian amd64 package
-        run: bash scripts/create-deb.sh amd64 x86_64-unknown-linux-gnu ${{ steps.version.outputs.VERSION }}
+        run: bash scripts/create-deb.sh amd64 x86_64-unknown-linux-gnu dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64 ${{ steps.version.outputs.VERSION }}
 
       - name: Create Debian arm64 package
-        run: bash scripts/create-deb.sh arm64 aarch64-unknown-linux-gnu ${{ steps.version.outputs.VERSION }}
+        run: bash scripts/create-deb.sh arm64 aarch64-unknown-linux-gnu dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64 ${{ steps.version.outputs.VERSION }}
 
       - name: Create RPM amd64 package
-        run: bash scripts/create-rpm.sh amd64 x86_64-unknown-linux-gnu ${{ steps.version.outputs.VERSION }}
+        run: bash scripts/create-rpm.sh amd64 x86_64-unknown-linux-gnu dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64 ${{ steps.version.outputs.VERSION }}
 
       - name: Create RPM arm64 package
-        run: bash scripts/create-rpm.sh arm64 aarch64-unknown-linux-gnu ${{ steps.version.outputs.VERSION }}
+        run: bash scripts/create-rpm.sh arm64 aarch64-unknown-linux-gnu dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64 ${{ steps.version.outputs.VERSION }}
 
-      - name: Create Arch package
-        run: bash scripts/create-arch.sh ${{ steps.version.outputs.VERSION }}
+      - name: Create Arch packages
+        run: |
+          bash scripts/create-arch.sh dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64 ${{ steps.version.outputs.VERSION }}
+          bash scripts/create-arch.sh dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64 ${{ steps.version.outputs.VERSION }}
 
       - name: Create source archive
         run: git archive --format=tar.gz --prefix=dns-ingress-${{ steps.version.outputs.VERSION }}/ -o dist/dns-ingress-${{ steps.version.outputs.VERSION }}-source.tar.gz HEAD

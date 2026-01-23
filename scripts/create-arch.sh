@@ -1,10 +1,11 @@
 #!/bin/bash
 set -e
 
-VERSION=$1
+BINARY_PATH=$1
+VERSION=$2
 
 mkdir -p pkgdir/{usr/bin,etc/dns-ingress,usr/lib/systemd/system}
-cp target/release/dns-ingress pkgdir/usr/bin/
+cp "$BINARY_PATH" pkgdir/usr/bin/dns-ingress
 cp CHANGELOG.md pkgdir/usr/share/doc/dns-ingress/ 2>/dev/null || true
 
 cat > pkgdir/usr/lib/systemd/system/dns-ingress.service <<'EOF'
@@ -24,7 +25,9 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-tar -C pkgdir -cf dns-ingress-${VERSION}-x86_64.tar .
-zstd -19 -T0 dns-ingress-${VERSION}-x86_64.tar -o dist/dns-ingress-${VERSION}-x86_64.pkg.tar.zst
+BASENAME=$(basename "$BINARY_PATH")
+tar -C pkgdir -cf "dist/${BASENAME}.tar" .
+zstd -19 -T0 "dist/${BASENAME}.tar" -o "dist/${BASENAME}.pkg.tar.zst"
+rm "dist/${BASENAME}.tar"
 
-echo "Created: dist/dns-ingress-${VERSION}-x86_64.pkg.tar.zst"
+echo "Created: dist/${BASENAME}.pkg.tar.zst"

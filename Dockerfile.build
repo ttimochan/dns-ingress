@@ -1,0 +1,11 @@
+FROM rust:1 AS builder
+
+WORKDIR /app
+
+COPY . .
+
+RUN cargo build --release
+
+FROM scratch
+
+COPY --from=builder /app/target/release/dns-ingress /dns-ingress

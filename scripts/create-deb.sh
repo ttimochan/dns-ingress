@@ -3,14 +3,15 @@ set -e
 
 ARCH=$1
 TARGET=$2
-VERSION=$3
+BINARY_PATH=$3
+VERSION=$4
 
 mkdir -p debian-pkg/DEBIAN
 mkdir -p debian-pkg/usr/bin
 mkdir -p debian-pkg/etc/dns-ingress
 mkdir -p debian-pkg/usr/lib/systemd/system
 
-cp target/$TARGET/release/dns-ingress debian-pkg/usr/bin/
+cp "$BINARY_PATH" debian-pkg/usr/bin/dns-ingress
 
 cat > debian-pkg/DEBIAN/control <<EOF
 Package: dns-ingress
