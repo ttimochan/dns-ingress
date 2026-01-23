@@ -11,7 +11,7 @@ use tracing::info;
 pub struct App {
     config: Arc<AppConfig>,
     pub rewriter: SniRewriterType,
-    pub metrics: Arc<Metrics>,
+    metrics: Arc<Metrics>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -59,14 +59,13 @@ impl App {
         }
 
         let config = Arc::clone(&self.config);
-        let metrics = Arc::clone(&self.metrics);
         let bind_addr = format!(
             "{}:{}",
             self.config.servers.healthcheck.bind_address, self.config.servers.healthcheck.port
         );
         let path = self.config.servers.healthcheck.path.clone();
         let handle = tokio::spawn(async move {
-            let server = HealthcheckServer::new(config, metrics);
+            let server = HealthcheckServer::new(config);
             if let Err(e) = server.start().await {
                 tracing::error!("Healthcheck server error: {}", e);
             }

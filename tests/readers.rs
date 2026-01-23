@@ -15,9 +15,7 @@ fn create_test_rewriter() -> dns_ingress::rewrite::SniRewriterType {
 #[test]
 fn test_healthcheck_server_new() {
     let config = Arc::new(AppConfig::default());
-    let metrics = Arc::new(Metrics::new());
-    let _server = HealthcheckServer::new(config, metrics);
-    // Just verify it can be created without panicking
+    let _server = HealthcheckServer::new(config);
 }
 
 #[test]
@@ -26,7 +24,6 @@ fn test_dot_server_new() {
     let rewriter = create_test_rewriter();
     let metrics = Arc::new(Metrics::new());
     let _server = DoTServer::new(config, rewriter, metrics);
-    // Just verify it can be created without panicking
 }
 
 #[test]
@@ -35,7 +32,6 @@ fn test_doh_server_new() {
     let rewriter = create_test_rewriter();
     let metrics = Arc::new(Metrics::new());
     let _server = DoHServer::new(config, rewriter, metrics);
-    // Just verify it can be created without panicking
 }
 
 #[test]
@@ -44,7 +40,6 @@ fn test_doq_server_new() {
     let rewriter = create_test_rewriter();
     let metrics = Arc::new(Metrics::new());
     let _server = DoQServer::new(config, rewriter, metrics);
-    // Just verify it can be created without panicking
 }
 
 #[test]
@@ -53,7 +48,6 @@ fn test_doh3_server_new() {
     let rewriter = create_test_rewriter();
     let metrics = Arc::new(Metrics::new());
     let _server = DoH3Server::new(config, rewriter, metrics);
-    // Just verify it can be created without panicking
 }
 
 #[tokio::test]
@@ -61,10 +55,8 @@ async fn test_healthcheck_server_start_disabled() {
     let mut config = AppConfig::default();
     config.servers.healthcheck.enabled = false;
     let config = Arc::new(config);
-    let metrics = Arc::new(Metrics::new());
-    let server = HealthcheckServer::new(config, metrics);
+    let server = HealthcheckServer::new(config);
 
-    // Should return Ok immediately when disabled
     let result = server.start().await;
     assert!(result.is_ok());
 }
@@ -78,7 +70,6 @@ async fn test_dot_server_start_disabled() {
     let metrics = Arc::new(Metrics::new());
     let server = DoTServer::new(config, rewriter, metrics);
 
-    // Should return Ok immediately when disabled
     let result = server.start().await;
     assert!(result.is_ok());
 }
@@ -92,7 +83,6 @@ async fn test_doh_server_start_disabled() {
     let metrics = Arc::new(Metrics::new());
     let server = DoHServer::new(config, rewriter, metrics);
 
-    // Should return Ok immediately when disabled
     let result = server.start().await;
     assert!(result.is_ok());
 }
@@ -106,7 +96,6 @@ async fn test_doq_server_start_disabled() {
     let metrics = Arc::new(Metrics::new());
     let server = DoQServer::new(config, rewriter, metrics);
 
-    // Should return Ok immediately when disabled
     let result = server.start().await;
     assert!(result.is_ok());
 }
@@ -120,7 +109,6 @@ async fn test_doh3_server_start_disabled() {
     let metrics = Arc::new(Metrics::new());
     let server = DoH3Server::new(config, rewriter, metrics);
 
-    // Should return Ok immediately when disabled
     let result = server.start().await;
     assert!(result.is_ok());
 }

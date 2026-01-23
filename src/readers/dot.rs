@@ -69,12 +69,11 @@ impl DoTServer {
                                     rewriter,
                                     upstream_addr,
                                     &upstream_host,
-                                    &metrics,
+                                    metrics,
                                 )
                                 .await
                                 {
                                     error!("DoT connection handling error from {}: {}", addr, e);
-                                    metrics.record_upstream_error();
                                 } else {
                                     tracing::debug!(
                                         "DoT connection from {} completed successfully",
@@ -90,7 +89,6 @@ impl DoTServer {
                 }
                 Err(e) => {
                     error!("DoT accept error on {}: {}", bind_addr, e);
-                    // Use exponential backoff to prevent tight error loop
                     let delay = self.backoff.next_delay(100, 5000);
                     tokio::time::sleep(delay).await;
                 }
@@ -103,7 +101,7 @@ impl DoTServer {
         _rewriter: SniRewriterType,
         upstream: std::net::SocketAddr,
         upstream_hostname: &str,
-        metrics: &Metrics,
+        metrics: Arc<Metrics>,
     ) -> DnsProxyResult<()> {
         use tracing::debug;
 

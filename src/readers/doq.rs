@@ -50,7 +50,7 @@ impl DoQServer {
             let rewriter = Arc::clone(&rewriter);
             let upstream_addr = upstream;
             let upstream_host = upstream_hostname.clone();
-            let metrics = Arc::clone(&metrics);
+            let m = Arc::clone(&metrics);
             tokio::spawn(async move {
                 match conn.await {
                     Ok(connection) => {
@@ -61,12 +61,11 @@ impl DoQServer {
                             upstream_addr,
                             rewriter,
                             &upstream_host,
-                            &metrics,
+                            m,
                         )
                         .await
                         {
                             error!("DoQ connection handling error from {}: {}", remote_addr, e);
-                            metrics.record_upstream_error();
                         } else {
                             tracing::debug!(
                                 "DoQ connection from {} completed successfully",
@@ -89,7 +88,7 @@ impl DoQServer {
         upstream: SocketAddr,
         _rewriter: SniRewriterType,
         upstream_hostname: &str,
-        metrics: &Metrics,
+        metrics: Arc<Metrics>,
     ) -> DnsProxyResult<()> {
         loop {
             let timer = Timer::start();
@@ -123,7 +122,6 @@ impl DoQServer {
                                 upstream, upstream_hostname, e
                             );
                             metrics.record_request(false, estimated_bytes, 0, duration);
-                            metrics.record_upstream_error();
                         }
                     }
                 }
@@ -133,7 +131,6 @@ impl DoQServer {
                 }
                 Err(e) => {
                     error!("DoQ stream error: {}", e);
-                    metrics.record_upstream_error();
                     break;
                 }
             }
