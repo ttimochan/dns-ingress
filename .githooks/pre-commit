@@ -1,0 +1,17 @@
+#!/bin/bash
+
+set -e
+
+echo "Running cargo fmt..."
+if ! cargo fmt -- --check; then
+    echo "Formatting code..."
+    cargo fmt
+fi
+
+echo "Running cargo clippy..."
+if ! cargo clippy -- -D warnings; then
+    echo "Clippy found issues. Please fix them before committing."
+    exit 1
+fi
+
+echo "Pre-commit checks passed!"

@@ -1,0 +1,156 @@
+#!/bin/bash
+
+# prepare-commit-msg hook to auto-generate commit message format
+# Based on Conventional Commits: https://www.conventionalcommits.org/
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="$2"  # can be: message, template, merge, squash, or commit
+
+# Only auto-generate when commit source is empty (not from -m, -t, etc.)
+if [ -n "$COMMIT_SOURCE" ]; then
+    exit 0
+fi
+
+# Get the branch name
+BRANCH_NAME=$(git symbolic-ref --short HEAD 2>/dev/null || echo "")
+
+# Get list of changed files
+CHANGED_FILES=$(git diff --cached --name-only 2>/dev/null | head -20)
+CHANGED_FILES=$(echo "$CHANGED_FILES" | grep -v '^$')
+
+if [ -z "$CHANGED_FILES" ]; then
+    exit 0
+fi
+
+# Determine commit type based on changed files
+detect_type() {
+    for file in $CHANGED_FILES; do
+        case "$file" in
+            README.md|*.md)
+                echo "docs"
+                exit 0
+                ;;
+            tests/*)
+                echo "test"
+                exit 0
+                ;;
+            src/main.rs|src/lib.rs|Cargo.toml)
+                echo "feat"
+                exit 0
+                ;;
+            src/*)
+                echo "refactor"
+                exit 0
+                ;;
+            .github/workflows/*|.gitignore|.cargo/*|Makefile|Dockerfile|docker-compose*)
+                echo "ci"
+                exit 0
+                ;;
+        esac
+    done
+    echo "chore"
+}
+
+# Check for breaking changes (CAPS in footer or ! in scope)
+detect_breaking() {
+    if git diff --cached | grep -qE "BREAKING CHANGE:|!" 2>/dev/null; then
+        echo "breaking"
+    fi
+}
+
+# Auto-generate commit message
+TYPE=$(detect_type)
+BREAKING=""
+
+# Check if it's a release commit
+if [[ "$BRANCH_NAME" == release/* ]] || [[ "$BRANCH_NAME" == v* ]]; then
+    TYPE="release"
+    VERSION=$(echo "$BRANCH_NAME" | sed 's/release\///' | sed 's/v//')
+    if [ -z "$VERSION" ]; then
+        VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/v//' || echo "1.0.0")
+    fi
+    echo "release: v$VERSION" > "$COMMIT_MSG_FILE"
+    exit 0
+fi
+
+# Generate conventional commit message
+case "$TYPE" in
+    feat)
+        SUBJECT="feat: "
+        ;;
+    fix)
+        SUBJECT="fix: "
+        ;;
+    docs)
+        SUBJECT="docs: "
+        ;;
+    test)
+        SUBJECT="test: "
+        ;;
+    refactor)
+        SUBJECT="refactor: "
+        ;;
+    ci)
+        SUBJECT="chore: "
+        ;;
+    *)
+        SUBJECT="chore: "
+        ;;
+esac
+
+# Get first line of existing message (if any)
+EXISTING_MSG=$(head -1 "$COMMIT_MSG_FILE" 2>/dev/null | sed 's/^#.*//')
+
+# If message is empty or just a comment, auto-generate
+if [ -z "$EXISTING_MSG" ]; then
+    # Try to generate a descriptive message from changed files
+    case "$TYPE" in
+        feat)
+            DESC="add new feature"
+            ;;
+        fix)
+            DESC="fix bug"
+            ;;
+        docs)
+            DESC="update documentation"
+            ;;
+        test)
+            DESC="add/update tests"
+            ;;
+        refactor)
+            DESC="refactor code"
+            ;;
+        ci)
+            DESC="update CI/config"
+            ;;
+        *)
+            DESC="update"
+            ;;
+    esac
+
+    # Try to extract more specific info from file changes
+    for file in $CHANGED_FILES; do
+        case "$file" in
+            src/metrics.rs)
+                DESC="remove prometheus metrics"
+                break
+                ;;
+            src/app.rs)
+                DESC="update app lifecycle management"
+                break
+                ;;
+            src/main.rs)
+                DESC="update main entry point"
+                break
+                ;;
+            Cargo.toml)
+                DESC="update dependencies"
+                break
+                ;;
+        esac
+    done
+
+    echo "${SUBJECT}${DESC}" > "$COMMIT_MSG_FILE"
+fi
+
+exit 0
