@@ -22,15 +22,30 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install Zig
+        uses: actions/zig-setup@v1
+        with:
+          version: 0.13
 
-      - name: Build binaries
+      - name: Install Rust targets
         run: |
-          docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.build -o type=local,dest=build .
+          rustup target add x86_64-unknown-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Build amd64 binary
+        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu
+
+      - name: Build arm64 binary
+        run: cargo zigbuild --release --target aarch64-unknown-linux-gnu
+
+      - name: Prepare binaries
+        run: |
           mkdir -p dist
-          cp build/dns-ingress-amd64 dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64
-          cp build/dns-ingress-arm64 dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64
+          cp target/x86_64-unknown-linux-gnu/release/dns-ingress dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64
+          cp target/aarch64-unknown-linux-gnu/release/dns-ingress dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64
 
       - name: Create Debian amd64 package
         run: bash scripts/create-deb.sh amd64 x86_64-unknown-linux-gnu dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64 ${{ steps.version.outputs.VERSION }}
