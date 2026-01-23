@@ -23,9 +23,11 @@ jobs:
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Install Zig
-        uses: actions/zig-setup@v1
-        with:
-          version: 0.13
+        run: |
+          wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar -xf zig-linux-x86_64-0.13.0.tar.xz
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> $GITHUB_PATH
+          rm zig-linux-x86_64-0.13.0.tar.xz
 
       - name: Install Rust targets
         run: |
