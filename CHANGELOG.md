@@ -1,5 +1,16 @@
 # Changelog
 
+## [v1.0.6-alpha.1] - 2026-01-24
+
+### CI Improvements
+- Use Docker for cross-platform builds (amd64 + arm64)
+- Optimize release workflow order
+- Add commit hooks for code quality
+
+### Bug Fixes
+- Correct RPM binary path in build script
+- Fix graceful shutdown mechanism
+
 ## [v1.0.5] - 2026-01-24
 
 ### Features
