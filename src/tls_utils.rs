@@ -20,6 +20,17 @@ impl CertificateResolver {
         }
     }
 
+    pub fn with_arc(config: Arc<AppConfig>) -> Self {
+        Self {
+            config: (*config).clone(),
+            cert_cache: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn tls_config(&self) -> &AppConfig {
+        &self.config
+    }
+
     pub async fn load_certificate(
         cert_config: &CertificateConfig,
     ) -> DnsProxyResult<Arc<CertifiedKey>> {

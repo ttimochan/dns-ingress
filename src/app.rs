@@ -3,11 +3,11 @@ use crate::error::DnsProxyResult;
 use crate::metrics::Metrics;
 use crate::rewrite::{SniRewriterType, create_rewriter};
 use crate::server::{ServerResources, ServerStarter};
+use crate::tls_utils::CertificateResolver;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
-/// DNS Proxy application that manages all protocol servers
 pub struct App {
     config: Arc<AppConfig>,
     pub rewriter: SniRewriterType,
@@ -16,7 +16,6 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new App instance with the given configuration
     pub fn new(config: AppConfig) -> Self {
         let config = Arc::new(config);
         let rewriter = create_rewriter(config.rewrite.clone());
@@ -29,10 +28,10 @@ impl App {
         }
     }
 
-    /// Start all enabled servers and return handles for graceful shutdown
     pub fn start(&mut self) -> DnsProxyResult<()> {
         info!("Starting DNS Proxy Server...");
 
+        self.preload_certificates();
         self.start_healthcheck_server();
         self.start_dot_server();
         self.start_doh_server();
@@ -43,12 +42,70 @@ impl App {
         Ok(())
     }
 
-    /// Wait for all server tasks to complete (for graceful shutdown)
+    fn preload_certificates(&self) {
+        if self.config.tls.default.is_none() && self.config.tls.certs.is_empty() {
+            warn!("No TLS certificates configured, TLS handshake will fail for incoming connections");
+            return;
+        }
+
+        info!("Preloading TLS certificates...");
+
+        let config = Arc::clone(&self.config);
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime for certificate preloading");
+
+            rt.block_on(async {
+                let resolver = CertificateResolver::with_arc(config);
+
+                if let Some(ref default_cert) = resolver.tls_config().tls.default {
+                    match CertificateResolver::load_certificate(default_cert).await {
+                        Ok(_) => info!("Preloaded default TLS certificate"),
+                        Err(e) => warn!("Failed to preload default certificate: {}", e),
+                    }
+                }
+
+                for (domain, cert_config) in &resolver.tls_config().tls.certs {
+                    match CertificateResolver::load_certificate(cert_config).await {
+                        Ok(_) => info!("Preloaded TLS certificate for domain: {}", domain),
+                        Err(e) => warn!("Failed to preload certificate for {}: {}", domain, e),
+                    }
+                }
+            });
+        });
+    }
+
     pub async fn wait_for_shutdown(&mut self) {
         info!("Waiting for all servers to shutdown...");
+
+        let mut remaining = self.handles.len();
+        while remaining > 0 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.handles.remove(0)
+            ).await;
+
+            match result {
+                Ok(_) => {
+                    remaining -= 1;
+                    if remaining > 0 {
+                        info!("{} server(s) remaining...", remaining);
+                    }
+                }
+                Err(_) => {
+                    warn!("Timeout waiting for server shutdown, forcing close...");
+                    break;
+                }
+            }
+        }
+
         for handle in self.handles.drain(..) {
             handle.abort();
         }
+
         info!("All servers shutdown complete");
     }
 
