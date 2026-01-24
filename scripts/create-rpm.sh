@@ -7,6 +7,9 @@ BINARY_PATH=$3
 VERSION=$4
 WORKSPACE=${GITHUB_WORKSPACE:-$(pwd)}
 
+# RPM doesn't allow '-' in version, replace with '.'
+RPM_VERSION=$(echo "$VERSION" | tr '-' '.')
+
 mkdir -p rpmbuild/SPECS
 
 # Create spec file
@@ -57,7 +60,7 @@ useradd -r -g dns-ingress -s /sbin/nologin dns-ingress 2>/dev/null || true
 EOFSPEC
 
 # Replace placeholders
-sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" rpmbuild/SPECS/dns-ingress.spec
+sed -i "s/VERSION_PLACEHOLDER/$RPM_VERSION/g" rpmbuild/SPECS/dns-ingress.spec
 sed -i "s/TARGET_PLACEHOLDER/$(echo $TARGET | cut -d'-' -f1)/g" rpmbuild/SPECS/dns-ingress.spec
 sed -i "s|BINARY_PATH|$BINARY_PATH|g" rpmbuild/SPECS/dns-ingress.spec
 
