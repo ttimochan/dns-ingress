@@ -68,14 +68,15 @@ useradd -r -g dns-ingress -s /sbin/nologin dns-ingress 2>/dev/null || true
 - Release $VERSION
 SPEC
 
-# Initialize RPM database
-mkdir -p /root/.rpmdb
-rpm --initdb --dbpath /root/.rpmdb 2>/dev/null || true
+# Create RPM database in a writable location
+export HOME=$(pwd)
+mkdir -p .rpmdb
+rpm --initdb --dbpath $(pwd)/.rpmdb 2>/dev/null || true
 
 # Build RPM with --target and --nocheck to skip architecture compatibility check
 rpmbuild -bb /tmp/dns-ingress.spec \
   --define "_topdir $(pwd)/rpmbuild" \
-  --define "_rpmdbpath /root/.rpmdb" \
+  --define "_rpmdbpath $(pwd)/.rpmdb" \
   --target $RPM_ARCH \
   --nocheck
 
