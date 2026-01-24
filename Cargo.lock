@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "dns-ingress"
-version = "1.0.6-alpha.1"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "async-trait",

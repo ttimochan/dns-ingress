@@ -1,15 +1,21 @@
 # Changelog
 
-## [v1.0.6-alpha.1] - 2026-01-24
+## [v1.0.7] - 2026-01-24
 
 ### CI Improvements
-- Use Docker for cross-platform builds (amd64 + arm64)
-- Optimize release workflow order
-- Add commit hooks for code quality
+- Use zigbuild for cross-platform compilation
+- Parallelize build and package jobs for faster releases
+- Use native ARM64 runners for arm64 packaging
+- Add GitHub Actions release workflow with multi-platform support
+
+### Features
+- Release automation for Debian, RPM, Arch Linux packages
+- Multi-architecture Docker image builds
 
 ### Bug Fixes
-- Correct RPM binary path in build script
-- Fix graceful shutdown mechanism
+- Fix RPM build script with proper path handling
+- Fix RPM version compatibility (replace '-' with '.')
+- Fix systemd unit path in RPM spec
 
 ## [v1.0.5] - 2026-01-24
 
