@@ -55,14 +55,19 @@ useradd -r -g dns-ingress -s /sbin/nologin dns-ingress 2>/dev/null || true
 %files
 %defattr(-,root,root,-)
 %dir /etc/dns-ingress
-%{_unitdir}/dns-ingress.service
+/usr/lib/systemd/system/dns-ingress.service
 %attr(755,root,root) %{_bindir}/dns-ingress
+
+%changelog
+* $(date '+%a %b %d %Y') - ttimochan - VERSION_PLACEHOLDER
+- Release VERSION_PLACEHOLDER
 EOFSPEC
 
 # Replace placeholders
 sed -i "s/VERSION_PLACEHOLDER/$RPM_VERSION/g" "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec"
 sed -i "s/TARGET_PLACEHOLDER/$(echo $TARGET | cut -d'-' -f1)/g" "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec"
 sed -i "s|BINARY_PATH|$BINARY_PATH|g" "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec"
+sed -i "s|VERSION_PLACEHOLDER|$VERSION|g" "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec"
 
 # Initialize RPM database
 HOME=/root rpm --initdb --dbpath /root/.rpmdb 2>/dev/null || true
