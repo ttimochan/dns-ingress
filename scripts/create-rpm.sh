@@ -10,10 +10,10 @@ WORKSPACE=${GITHUB_WORKSPACE:-$(pwd)}
 # RPM doesn't allow '-' in version, replace with '.'
 RPM_VERSION=$(echo "$VERSION" | tr '-' '.')
 
-mkdir -p rpmbuild/SPECS
+mkdir -p "$WORKSPACE/rpmbuild/SPECS"
 
 # Create spec file
-cat > rpmbuild/SPECS/dns-ingress.spec <<'EOFSPEC'
+cat > "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec" <<'EOFSPEC'
 Name:           dns-ingress
 Version:        VERSION_PLACEHOLDER
 Release:        1
@@ -60,18 +60,19 @@ useradd -r -g dns-ingress -s /sbin/nologin dns-ingress 2>/dev/null || true
 EOFSPEC
 
 # Replace placeholders
-sed -i "s/VERSION_PLACEHOLDER/$RPM_VERSION/g" rpmbuild/SPECS/dns-ingress.spec
-sed -i "s/TARGET_PLACEHOLDER/$(echo $TARGET | cut -d'-' -f1)/g" rpmbuild/SPECS/dns-ingress.spec
-sed -i "s|BINARY_PATH|$BINARY_PATH|g" rpmbuild/SPECS/dns-ingress.spec
+sed -i "s/VERSION_PLACEHOLDER/$RPM_VERSION/g" "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec"
+sed -i "s/TARGET_PLACEHOLDER/$(echo $TARGET | cut -d'-' -f1)/g" "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec"
+sed -i "s|BINARY_PATH|$BINARY_PATH|g" "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec"
 
 # Initialize RPM database
 HOME=/root rpm --initdb --dbpath /root/.rpmdb 2>/dev/null || true
 
 # Build RPM
-HOME=/root rpmbuild -bb rpmbuild/SPECS/dns-ingress.spec \
+cd "$WORKSPACE"
+HOME=/root rpmbuild -bb "$WORKSPACE/rpmbuild/SPECS/dns-ingress.spec" \
   --define "_topdir $WORKSPACE/rpmbuild" \
   --define "_rpmdbpath /root/.rpmdb"
 
-find rpmbuild/RPMS -name "*.rpm" -exec cp {} dist/ \;
+find "$WORKSPACE/rpmbuild/RPMS" -name "*.rpm" -exec cp {} dist/ \;
 
 echo "Created RPM packages in dist/"

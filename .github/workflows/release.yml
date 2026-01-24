@@ -56,10 +56,14 @@ jobs:
         run: bash scripts/create-deb.sh arm64 aarch64-unknown-linux-gnu dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64 ${{ steps.version.outputs.VERSION }}
 
       - name: Create RPM amd64 package
-        run: bash scripts/create-rpm.sh amd64 x86_64-unknown-linux-gnu dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64 ${{ steps.version.outputs.VERSION }}
+        run: |
+          BINARY_PATH="${{ github.workspace }}/dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-amd64"
+          bash scripts/create-rpm.sh amd64 x86_64-unknown-linux-gnu "$BINARY_PATH" ${{ steps.version.outputs.VERSION }}
 
       - name: Create RPM arm64 package
-        run: bash scripts/create-rpm.sh arm64 aarch64-unknown-linux-gnu dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64 ${{ steps.version.outputs.VERSION }}
+        run: |
+          BINARY_PATH="${{ github.workspace }}/dist/dns-ingress-${{ steps.version.outputs.VERSION }}-linux-arm64"
+          bash scripts/create-rpm.sh arm64 aarch64-unknown-linux-gnu "$BINARY_PATH" ${{ steps.version.outputs.VERSION }}
 
       - name: Create Arch packages
         run: |
