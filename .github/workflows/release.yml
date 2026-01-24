@@ -78,7 +78,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: deb-amd64
-          path: dist/dns-ingress_${{ needs.build-binary.outputs.version }}_amd64.deb
+          path: dist/dns-ingress_*.deb
 
   package-deb-arm64:
     name: Package Debian arm64
@@ -103,7 +103,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: deb-arm64
-          path: dist/dns-ingress_${{ needs.build-binary.outputs.version }}_arm64.deb
+          path: dist/dns-ingress_*.deb
 
   package-rpm-amd64:
     name: Package RPM amd64
@@ -132,7 +132,7 @@ jobs:
 
   package-rpm-arm64:
     name: Package RPM arm64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-arm64
     needs: build-binary
     steps:
       - name: Checkout scripts
@@ -182,7 +182,7 @@ jobs:
 
   package-arch-arm64:
     name: Package Arch arm64
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-arm64
     needs: build-binary
     steps:
       - name: Checkout scripts
