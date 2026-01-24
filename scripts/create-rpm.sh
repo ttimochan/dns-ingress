@@ -12,6 +12,9 @@ RPM_VERSION=$(echo "$VERSION" | tr '-' '.')
 # Get absolute path to binary
 BINARY_ABS=$(realpath "$BINARY_PATH")
 
+# Get target arch for rpm
+RPM_ARCH=$(echo $TARGET | cut -d'-' -f1)
+
 # Create spec file with proper escaping
 CHANGELOG_DATE=$(date '+%a %b %d %Y')
 
@@ -22,7 +25,7 @@ Release:        1
 Summary:        DNS Proxy Server with SNI Routing
 License:        AGPL-3.0
 URL:            https://github.com/ttimochan/dns-ingress
-BuildArch:      $(echo $TARGET | cut -d'-' -f1)
+BuildArch:      $RPM_ARCH
 
 %description
 A high-performance DNS proxy server supporting DoT, DoH, DoQ, and DoH3 protocols.
@@ -66,12 +69,15 @@ useradd -r -g dns-ingress -s /sbin/nologin dns-ingress 2>/dev/null || true
 SPEC
 
 # Initialize RPM database
+mkdir -p /root/.rpmdb
 rpm --initdb --dbpath /root/.rpmdb 2>/dev/null || true
 
-# Build RPM
+# Build RPM with --target and --nocheck to skip architecture compatibility check
 rpmbuild -bb /tmp/dns-ingress.spec \
   --define "_topdir $(pwd)/rpmbuild" \
-  --define "_rpmdbpath /root/.rpmdb"
+  --define "_rpmdbpath /root/.rpmdb" \
+  --target $RPM_ARCH \
+  --nocheck
 
 # Move result to dist
 mkdir -p dist
