@@ -29,7 +29,7 @@ A high-performance DNS proxy server supporting DoT, DoH, DoQ, and DoH3 protocols
 mkdir -p %{buildroot}/usr/bin
 mkdir -p %{buildroot}/etc/dns-ingress
 mkdir -p %{buildroot}/usr/lib/systemd/system
-cp BINARY_PATH/dns-ingress %{buildroot}/usr/bin/
+cp BINARY_PATH/dns-ingress %{buildroot}/usr/bin/dns-ingress
 
 cat > %{buildroot}/usr/lib/systemd/system/dns-ingress.service <<'SERVICE'
 [Unit]
