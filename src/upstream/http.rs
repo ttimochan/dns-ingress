@@ -1,17 +1,28 @@
-use crate::proxy::http::{is_dns_message_content_type, validate_dns_message};
+use crate::proxy::http::{
+    collect_body_with_progress, is_dns_message_content_type, validate_dns_message,
+};
 use crate::upstream::pool::ConnectionPool;
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::Full;
 use hyper::{Method, Request, Response, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
-const MAX_DNS_MESSAGE_SIZE: usize = u16::MAX as usize;
-
+#[allow(dead_code)] // retained as the public default-trust constructor
 pub fn create_connection_pool_with_limit(max_clients: usize) -> Arc<ConnectionPool> {
     Arc::new(ConnectionPool::with_max_clients(max_clients))
+}
+
+pub fn create_connection_pool_with_limit_and_root_store(
+    max_clients: usize,
+    root_store: Arc<rustls::RootCertStore>,
+) -> Arc<ConnectionPool> {
+    Arc::new(ConnectionPool::with_max_clients_and_root_store(
+        max_clients,
+        root_store,
+    ))
 }
 
 /// Forward HTTP request to upstream server with timeout control
@@ -30,7 +41,7 @@ pub async fn forward_http_request(
 ) -> Result<(Response<Full<Bytes>>, u64)> {
     // Get or create a client for this SNI (target_hostname)
     // This ensures connection reuse for the same target
-    let client = pool.get_client(target_hostname);
+    let client = pool.get_client(target_hostname)?;
     let mut req = Request::builder()
         .method(method.clone())
         .uri(upstream_uri)
@@ -79,20 +90,12 @@ pub async fn forward_http_request(
                 status, upstream_uri
             );
 
-            let body_bytes = tokio::time::timeout(
+            let body_bytes = collect_body_with_progress(
+                body,
                 timeout,
-                Limited::new(body, MAX_DNS_MESSAGE_SIZE).collect(),
+                &format!("Upstream response body for {upstream_uri}"),
             )
-            .await
-            .map_err(|_| anyhow::anyhow!("Upstream response body timed out: {}", upstream_uri))?
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "Upstream response exceeds the DNS message limit or could not be read: {}: {}",
-                    upstream_uri,
-                    error
-                )
-            })?
-            .to_bytes();
+            .await?;
 
             let body_size = body_bytes.len() as u64;
             debug!("Response body size: {} bytes", body_size);

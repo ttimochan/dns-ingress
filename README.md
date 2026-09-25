@@ -329,6 +329,9 @@ max_upstream_pool_entries = 256
 transaction_timeout_seconds = 30
 
 [tls]
+# Optional PEM bundle for validating private-PKI rewritten upstreams.
+# This is outbound trust only; it does not enable inbound mTLS.
+# upstream_ca_file = "/path/to/private-upstream-ca.pem"
 # Default certificate config (optional, used when no domain-specific certificate found)
 [tls.default]
 cert_file = "/path/to/default-cert.pem"
@@ -390,6 +393,9 @@ for reuse. `transaction_timeout_seconds` is a no-progress I/O timeout.
 - **`[tls.certs.<domain>]`**: Domain-specific certificate config
   - **`cert_file`**: Certificate file path (PEM format)
   - **`key_file`**: Private key file path (PEM format)
+- **`upstream_ca_file`**: Optional PEM bundle appended to public roots when
+  validating rewritten upstreams; it does not configure client authentication.
+  The bundle is loaded once at application startup; restart after rotating it.
 
 #### `[logging]` - Logging Config
 

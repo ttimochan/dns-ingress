@@ -2,7 +2,9 @@ use crate::config::AppConfig;
 use crate::error::{DnsProxyError, DnsProxyResult};
 use crate::metrics::Metrics;
 use crate::rewrite::{SniRewriterType, create_rewriter};
+use crate::tasks::TaskGroup;
 use crate::tls_utils::CertificateResolver;
+use futures::future::join_all;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
@@ -20,6 +22,7 @@ pub struct App {
     shutdown: CancellationToken,
     failed: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
+    task_groups: Vec<TaskGroup>,
 }
 
 impl App {
@@ -34,6 +37,7 @@ impl App {
             shutdown: CancellationToken::new(),
             failed: Arc::new(AtomicBool::new(false)),
             handles: Vec::new(),
+            task_groups: Vec::new(),
         }
     }
 
@@ -41,7 +45,7 @@ impl App {
     /// socket. A successful return is therefore a real readiness boundary.
     pub async fn start(&mut self) -> DnsProxyResult<()> {
         info!("Starting DNS Proxy Server...");
-        self.config.validate()?;
+        let upstream_roots = self.config.validate_and_load_upstream_roots()?;
         self.ready.store(false, Ordering::Release);
         self.failed.store(false, Ordering::Release);
 
@@ -68,25 +72,30 @@ impl App {
             let config = Arc::clone(&self.config);
             let metrics = Arc::clone(&self.metrics);
             let ready = Arc::clone(&self.ready);
-            readiness.push(
-                self.spawn_server("healthcheck", move |shutdown, sender| async move {
-                    crate::readers::HealthcheckServer::with_metrics_and_readiness(
-                        config, metrics, ready,
-                    )
-                    .run(shutdown, Some(sender))
-                    .await
-                }),
+            let server = crate::readers::HealthcheckServer::with_metrics_and_readiness(
+                config, metrics, ready,
             );
+            let tasks = server.task_group();
+            readiness.push(self.spawn_server(
+                "healthcheck",
+                tasks,
+                move |shutdown, sender| async move { server.run(shutdown, Some(sender)).await },
+            ));
         }
         if self.config.servers.dot.enabled {
             let config = Arc::clone(&self.config);
             let rewriter = Arc::clone(&self.rewriter);
             let metrics = Arc::clone(&self.metrics);
+            let server = crate::readers::DoTServer::with_root_store(
+                config,
+                rewriter,
+                metrics,
+                Arc::clone(&upstream_roots),
+            );
+            let tasks = server.task_group();
             readiness.push(
-                self.spawn_server("DoT", move |shutdown, sender| async move {
-                    crate::readers::DoTServer::new(config, rewriter, metrics)
-                        .run(shutdown, Some(sender))
-                        .await
+                self.spawn_server("DoT", tasks, move |shutdown, sender| async move {
+                    server.run(shutdown, Some(sender)).await
                 }),
             );
         }
@@ -94,11 +103,16 @@ impl App {
             let config = Arc::clone(&self.config);
             let rewriter = Arc::clone(&self.rewriter);
             let metrics = Arc::clone(&self.metrics);
+            let server = crate::readers::DoHServer::with_root_store(
+                config,
+                rewriter,
+                metrics,
+                Arc::clone(&upstream_roots),
+            );
+            let tasks = server.task_group();
             readiness.push(
-                self.spawn_server("DoH", move |shutdown, sender| async move {
-                    crate::readers::DoHServer::new(config, rewriter, metrics)
-                        .run(shutdown, Some(sender))
-                        .await
+                self.spawn_server("DoH", tasks, move |shutdown, sender| async move {
+                    server.run(shutdown, Some(sender)).await
                 }),
             );
         }
@@ -106,11 +120,16 @@ impl App {
             let config = Arc::clone(&self.config);
             let rewriter = Arc::clone(&self.rewriter);
             let metrics = Arc::clone(&self.metrics);
+            let server = crate::readers::DoQServer::with_root_store(
+                config,
+                rewriter,
+                metrics,
+                Arc::clone(&upstream_roots),
+            );
+            let tasks = server.task_group();
             readiness.push(
-                self.spawn_server("DoQ", move |shutdown, sender| async move {
-                    crate::readers::DoQServer::new(config, rewriter, metrics)
-                        .run(shutdown, Some(sender))
-                        .await
+                self.spawn_server("DoQ", tasks, move |shutdown, sender| async move {
+                    server.run(shutdown, Some(sender)).await
                 }),
             );
         }
@@ -118,11 +137,16 @@ impl App {
             let config = Arc::clone(&self.config);
             let rewriter = Arc::clone(&self.rewriter);
             let metrics = Arc::clone(&self.metrics);
+            let server = crate::readers::DoH3Server::with_root_store(
+                config,
+                rewriter,
+                metrics,
+                Arc::clone(&upstream_roots),
+            );
+            let tasks = server.task_group();
             readiness.push(
-                self.spawn_server("DoH3", move |shutdown, sender| async move {
-                    crate::readers::DoH3Server::new(config, rewriter, metrics)
-                        .run(shutdown, Some(sender))
-                        .await
+                self.spawn_server("DoH3", tasks, move |shutdown, sender| async move {
+                    server.run(shutdown, Some(sender)).await
                 }),
             );
         }
@@ -160,6 +184,7 @@ impl App {
     fn spawn_server<F, Fut>(
         &mut self,
         name: &'static str,
+        tasks: TaskGroup,
         runner: F,
     ) -> (&'static str, oneshot::Receiver<DnsProxyResult<()>>)
     where
@@ -170,6 +195,7 @@ impl App {
         let shutdown = self.shutdown.clone();
         let ready = Arc::clone(&self.ready);
         let failed = Arc::clone(&self.failed);
+        self.task_groups.push(tasks);
         self.handles.push(tokio::spawn(async move {
             if let Err(error) = runner(shutdown.clone(), sender).await
                 && !shutdown.is_cancelled()
@@ -188,6 +214,16 @@ impl App {
         self.ready.store(false, Ordering::Release);
         self.shutdown.cancel();
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        // Close child supervisors independently of listener completion.  This
+        // makes the global deadline authoritative even if a listener itself
+        // has to be aborted below.
+        let groups = std::mem::take(&mut self.task_groups);
+        join_all(
+            groups
+                .iter()
+                .map(|group| group.close_and_wait_until(deadline)),
+        )
+        .await;
         let total = self.handles.len();
         for mut handle in self.handles.drain(..) {
             match tokio::time::timeout_at(deadline, &mut handle).await {

@@ -119,6 +119,10 @@ pub struct TlsConfig {
     /// Key is the domain name (e.g., "example.com"), value is the certificate config
     #[serde(default)]
     pub certs: std::collections::HashMap<String, CertificateConfig>,
+    /// Optional PEM bundle trusted for outbound connections to rewritten
+    /// upstreams. This does not enable client certificates or inbound mTLS.
+    #[serde(default)]
+    pub upstream_ca_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,8 +293,23 @@ impl AppConfig {
         Ok(config)
     }
 
-    /// Validate configuration before starting servers
+    /// Validate configuration before starting servers.
     pub fn validate(&self) -> Result<()> {
+        self.validate_and_load_upstream_roots().map(|_| ())
+    }
+
+    /// Validate once and return the application-owned outbound trust store.
+    /// Keeping this crate-visible prevents App::start from parsing the same PEM
+    /// bundle a second time after validation.
+    pub(crate) fn validate_and_load_upstream_roots(
+        &self,
+    ) -> Result<std::sync::Arc<rustls::RootCertStore>> {
+        self.validate_structure()?;
+        crate::tls_utils::load_upstream_root_store(self.tls.upstream_ca_file.as_deref())
+            .map_err(|error| anyhow::anyhow!("Invalid upstream CA certificate bundle: {error}"))
+    }
+
+    fn validate_structure(&self) -> Result<()> {
         use std::collections::HashSet;
 
         // Check for port conflicts
@@ -362,6 +381,14 @@ impl AppConfig {
                 format!(
                     "Key file not found for {}: {}",
                     domain, cert_config.key_file
+                )
+            })?;
+        }
+        if let Some(upstream_ca_file) = &self.tls.upstream_ca_file {
+            std::fs::metadata(upstream_ca_file).with_context(|| {
+                format!(
+                    "Upstream CA certificate file not found: {}",
+                    upstream_ca_file
                 )
             })?;
         }

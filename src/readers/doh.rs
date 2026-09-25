@@ -3,7 +3,8 @@ use crate::error::DnsProxyResult;
 use crate::metrics::Metrics;
 use crate::proxy::handle_http_request;
 use crate::rewrite::SniRewriterType;
-use crate::upstream::create_connection_pool_with_limit;
+use crate::tasks::TaskGroup;
+use crate::upstream::create_connection_pool_with_limit_and_root_store;
 use crate::upstream::pool::ConnectionPool;
 use crate::utils::backoff::BackoffCounter;
 use hyper::service::service_fn;
@@ -22,18 +23,40 @@ pub struct DoHServer {
     pool: Arc<ConnectionPool>,
     backoff: Arc<BackoffCounter>,
     metrics: Arc<Metrics>,
+    tasks: TaskGroup,
 }
 
 impl DoHServer {
+    #[allow(dead_code)] // retained for standalone reader construction
     pub fn new(config: Arc<AppConfig>, rewriter: SniRewriterType, metrics: Arc<Metrics>) -> Self {
+        let root_store =
+            crate::tls_utils::load_upstream_root_store(config.tls.upstream_ca_file.as_deref())
+                .expect("standalone DoH server requires a valid upstream trust store");
+        Self::with_root_store(config, rewriter, metrics, root_store)
+    }
+
+    pub(crate) fn with_root_store(
+        config: Arc<AppConfig>,
+        rewriter: SniRewriterType,
+        metrics: Arc<Metrics>,
+        root_store: Arc<rustls::RootCertStore>,
+    ) -> Self {
         let max_upstream_pool_entries = config.limits.max_upstream_pool_entries;
         Self {
             config,
             rewriter,
-            pool: create_connection_pool_with_limit(max_upstream_pool_entries),
+            pool: create_connection_pool_with_limit_and_root_store(
+                max_upstream_pool_entries,
+                root_store,
+            ),
             backoff: Arc::new(BackoffCounter::new()),
             metrics,
+            tasks: TaskGroup::default(),
         }
+    }
+
+    pub(crate) fn task_group(&self) -> TaskGroup {
+        self.tasks.clone()
     }
 
     /// Standalone entry point retained for reader-level tests. Applications
@@ -101,9 +124,12 @@ impl DoHServer {
             };
             match accepted {
                 Ok((stream, addr)) => {
-                    let permit = match Arc::clone(&connection_limit).acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => break,
+                    let permit = tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        permit = Arc::clone(&connection_limit).acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        },
                     };
                     let rewriter = Arc::clone(&rewriter);
                     let pool = Arc::clone(&pool);
@@ -112,9 +138,19 @@ impl DoHServer {
                     let endpoint = endpoint.clone();
                     let request_path = request_path.clone();
                     let shutdown = shutdown.clone();
-                    tokio::spawn(async move {
+                    let tasks = self.tasks.clone();
+                    tasks.spawn(async move {
                         let _connection_permit = permit;
-                        let tls_stream = match acceptor.accept(stream).await {
+                        let tls_stream = match tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            result = tokio::time::timeout(transaction_timeout, acceptor.accept(stream)) => match result {
+                                Ok(stream) => stream,
+                                Err(_) => {
+                                    error!("DoH TLS handshake from {} timed out", addr);
+                                    return;
+                                }
+                            },
+                        } {
                             Ok(stream) => stream,
                             Err(e) => {
                                 error!("DoH TLS handshake error from {}: {}", addr, e);
@@ -171,7 +207,7 @@ impl DoHServer {
                         } else {
                             tracing::debug!("DoH connection from {} completed", addr);
                         }
-                    });
+                    }).await;
                 }
                 Err(e) => {
                     error!("DoH accept error on {}: {}", bind_addr, e);
@@ -181,6 +217,9 @@ impl DoHServer {
                 }
             }
         }
+        self.tasks
+            .close_and_wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
         Ok(())
     }
 }

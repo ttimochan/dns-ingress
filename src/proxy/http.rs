@@ -7,7 +7,7 @@ use crate::upstream::pool::ConnectionPool;
 use anyhow::{Context, Result};
 use base64::Engine;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Limited};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use std::sync::Arc;
@@ -15,6 +15,35 @@ use tracing::{debug, info};
 
 const DNS_MESSAGE_MEDIA_TYPE: &str = "application/dns-message";
 pub(crate) const MAX_DNS_MESSAGE_SIZE: usize = u16::MAX as usize;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BodyCollectionError {
+    #[error("{operation} stalled without progress")]
+    Stalled { operation: String },
+    #[error("{operation} exceeds the DNS message limit")]
+    TooLarge { operation: String },
+    #[error("{operation} could not be read: {reason}")]
+    Read { operation: String, reason: String },
+}
+
+#[derive(Debug)]
+enum DohHttpError {
+    BadRequest,
+    NotFound,
+    MethodNotAllowed,
+    UnsupportedMediaType,
+    PayloadTooLarge,
+    RequestTimeout,
+    GatewayTimeout,
+    BadGateway,
+}
+
+impl From<anyhow::Error> for DohHttpError {
+    fn from(error: anyhow::Error) -> Self {
+        let _ = error;
+        Self::BadRequest
+    }
+}
 
 /// Validate the wire representation shared by DoH over TCP and HTTP/3.
 /// DNS messages always contain the twelve-octet DNS header; accepting a
@@ -53,6 +82,39 @@ pub(crate) fn validate_doh_get_query(uri: &hyper::Uri, protocol: &str) -> Result
     validate_dns_message(&message, &format!("{protocol} GET dns query parameter"))
 }
 
+/// Collect a bounded HTTP body while resetting the deadline after each frame.
+/// `transaction_timeout_seconds` is a no-progress limit, not a total transfer
+/// duration: a slow peer that keeps delivering DNS payload bytes may finish.
+pub(crate) async fn collect_body_with_progress(
+    mut body: Incoming,
+    timeout: std::time::Duration,
+    operation: &str,
+) -> std::result::Result<Bytes, BodyCollectionError> {
+    let mut collected = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(timeout, body.frame())
+            .await
+            .map_err(|_| BodyCollectionError::Stalled {
+                operation: operation.to_string(),
+            })?;
+        let Some(frame) = frame else { break };
+        let frame = frame.map_err(|error| BodyCollectionError::Read {
+            operation: operation.to_string(),
+            reason: error.to_string(),
+        })?;
+        if let Ok(data) = frame.into_data() {
+            let remaining = MAX_DNS_MESSAGE_SIZE.saturating_sub(collected.len());
+            if data.len() > remaining {
+                return Err(BodyCollectionError::TooLarge {
+                    operation: operation.to_string(),
+                });
+            }
+            collected.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(collected))
+}
+
 /// Handle HTTP request with SNI rewriting and upstream forwarding
 #[allow(clippy::too_many_arguments)] // request context is supplied by the TLS connection
 pub async fn handle_http_request(
@@ -78,7 +140,10 @@ pub async fn handle_http_request(
     .await
     {
         Ok(response) => response,
-        Err(error) => doh_error_response(&error.to_string()),
+        Err(error) => {
+            debug!(?error, "DoH request rejected");
+            doh_error_response(error)
+        }
     }
 }
 
@@ -92,13 +157,13 @@ async fn handle_http_request_inner(
     request_path: &str,
     tls_sni: &str,
     transaction_timeout: std::time::Duration,
-) -> Result<Response<http_body_util::Full<hyper::body::Bytes>>> {
+) -> std::result::Result<Response<http_body_util::Full<hyper::body::Bytes>>, DohHttpError> {
     let timer = Timer::start();
     let method = req.method().clone();
     let uri = req.uri().clone();
 
     if uri.path() != request_path {
-        anyhow::bail!("DoH request path must be {}", request_path);
+        return Err(DohHttpError::NotFound);
     }
 
     let host = req
@@ -122,10 +187,10 @@ async fn handle_http_request_inner(
     let host = crate::utils::normalize_hostname(&host)
         .ok_or_else(|| anyhow::anyhow!("Invalid DoH Host header"))?;
     if host != tls_sni {
-        anyhow::bail!("DoH Host ({}) does not match TLS SNI ({})", host, tls_sni);
+        return Err(DohHttpError::BadRequest);
     }
     if method != Method::GET && method != Method::POST {
-        anyhow::bail!("DoH only supports GET and POST");
+        return Err(DohHttpError::MethodNotAllowed);
     }
 
     if method == Method::GET {
@@ -136,7 +201,7 @@ async fn handle_http_request_inner(
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
         if !is_dns_message_content_type(content_type) {
-            anyhow::bail!("DoH POST Content-Type must be application/dns-message");
+            return Err(DohHttpError::UnsupportedMediaType);
         }
     }
 
@@ -184,15 +249,13 @@ async fn handle_http_request_inner(
 
     // Extract body if POST (zerocopy: reuse bytes when possible)
     let body = if method == Method::POST {
-        Limited::new(req.into_body(), MAX_DNS_MESSAGE_SIZE)
-            .collect()
+        collect_body_with_progress(req.into_body(), transaction_timeout, "DoH request body")
             .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "DoH request body exceeds the DNS message limit or could not be read: {error}"
-                )
+            .map_err(|error| match error {
+                BodyCollectionError::Stalled { .. } => DohHttpError::RequestTimeout,
+                BodyCollectionError::TooLarge { .. } => DohHttpError::PayloadTooLarge,
+                BodyCollectionError::Read { .. } => DohHttpError::BadRequest,
             })?
-            .to_bytes()
     } else {
         Bytes::new()
     };
@@ -233,44 +296,58 @@ async fn handle_http_request_inner(
             debug!("HTTP request failed: {}", e);
             metrics.record_request(false, bytes_received, 0, duration);
             metrics.record_upstream_error();
-            Err(e).with_context(|| {
-                format!(
-                    "Failed to forward HTTP request to upstream: {}",
-                    upstream_uri
-                )
-            })
+            if matches!(
+                e.downcast_ref::<BodyCollectionError>(),
+                Some(BodyCollectionError::Stalled { .. })
+            ) {
+                Err(DohHttpError::GatewayTimeout)
+            } else {
+                Err(DohHttpError::BadGateway)
+            }
         }
     }
 }
 
-fn doh_error_response(message: &str) -> Response<http_body_util::Full<hyper::body::Bytes>> {
-    let status = if message.contains("request path") {
-        StatusCode::NOT_FOUND
-    } else if message.contains("only supports GET and POST") {
-        StatusCode::METHOD_NOT_ALLOWED
-    } else if message.contains("Content-Type") {
-        StatusCode::UNSUPPORTED_MEDIA_TYPE
-    } else if message.contains("exceeds the DNS message limit") || message.contains("65535 bytes") {
-        StatusCode::PAYLOAD_TOO_LARGE
-    } else if message.contains("Failed to forward HTTP request to upstream")
-        || message.contains("upstream response")
-    {
-        StatusCode::BAD_GATEWAY
-    } else {
-        StatusCode::BAD_REQUEST
+fn doh_error_response(error: DohHttpError) -> Response<http_body_util::Full<hyper::body::Bytes>> {
+    let (status, message, allow) = match error {
+        DohHttpError::BadRequest => (StatusCode::BAD_REQUEST, "invalid DoH request", None),
+        DohHttpError::NotFound => (StatusCode::NOT_FOUND, "DoH endpoint not found", None),
+        DohHttpError::MethodNotAllowed => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+            Some("GET, POST"),
+        ),
+        DohHttpError::UnsupportedMediaType => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/dns-message",
+            None,
+        ),
+        DohHttpError::PayloadTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "DNS message exceeds 65535 bytes",
+            None,
+        ),
+        DohHttpError::RequestTimeout => {
+            (StatusCode::REQUEST_TIMEOUT, "request body timed out", None)
+        }
+        DohHttpError::GatewayTimeout => (StatusCode::GATEWAY_TIMEOUT, "upstream timed out", None),
+        DohHttpError::BadGateway => (StatusCode::BAD_GATEWAY, "upstream request failed", None),
     };
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
-        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(http_body_util::Full::new(hyper::body::Bytes::from(
-            message.to_string(),
-        )))
+        .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8");
+    if let Some(allow) = allow {
+        builder = builder.header(hyper::header::ALLOW, allow);
+    }
+    builder
+        .body(http_body_util::Full::new(hyper::body::Bytes::from(message)))
         .expect("static DoH error response is valid")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_dns_message, validate_doh_get_query};
+    use super::{DohHttpError, doh_error_response, validate_dns_message, validate_doh_get_query};
+    use hyper::StatusCode;
 
     #[test]
     fn get_dns_parameter_requires_decodable_dns_wire_message() {
@@ -280,5 +357,24 @@ mod tests {
         let malformed = hyper::Uri::from_static("/dns-query?dns=not%2Bbase64");
         assert!(validate_doh_get_query(&malformed, "DoH").is_err());
         assert!(validate_dns_message(&[0; 11], "test").is_err());
+    }
+
+    #[test]
+    fn typed_errors_have_stable_http_semantics() {
+        let not_found = doh_error_response(DohHttpError::NotFound);
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+
+        let method = doh_error_response(DohHttpError::MethodNotAllowed);
+        assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(method.headers()[hyper::header::ALLOW], "GET, POST");
+
+        assert_eq!(
+            doh_error_response(DohHttpError::RequestTimeout).status(),
+            StatusCode::REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            doh_error_response(DohHttpError::GatewayTimeout).status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
     }
 }

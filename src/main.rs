@@ -9,6 +9,7 @@ mod readers;
 mod rewrite;
 mod rewriters;
 mod sni;
+mod tasks;
 mod tls_utils;
 mod upstream;
 mod utils;

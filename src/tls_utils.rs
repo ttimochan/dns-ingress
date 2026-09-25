@@ -5,6 +5,65 @@ use rustls::sign::CertifiedKey;
 use std::io::BufReader;
 use std::sync::Arc;
 
+/// Build the trust store for outbound upstream TLS. Public WebPKI roots are
+/// retained and an operator may append a private-PKI PEM bundle for rewritten
+/// upstreams. The latter is deliberately separate from inbound mTLS settings.
+pub fn create_upstream_root_store(
+    upstream_ca_file: Option<&str>,
+) -> DnsProxyResult<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Keep parseable platform-installed enterprise roots in addition to the
+    // portable WebPKI bundle.
+    for certificate in rustls_native_certs::load_native_certs().certs {
+        roots.add(certificate).map_err(|error| {
+            DnsProxyError::Certificate(CertificateError::InvalidFormat {
+                reason: format!("Failed to add native upstream CA certificate: {error}"),
+            })
+        })?;
+    }
+    if let Some(path) = upstream_ca_file {
+        let bytes = std::fs::read(path).map_err(|error| {
+            DnsProxyError::Certificate(CertificateError::LoadFailed {
+                path: path.to_string(),
+                reason: error.to_string(),
+            })
+        })?;
+        let mut reader = BufReader::new(bytes.as_slice());
+        let certificates = rustls_pemfile::certs(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                DnsProxyError::Certificate(CertificateError::InvalidFormat {
+                    reason: format!("Failed to parse upstream CA bundle: {error}"),
+                })
+            })?;
+        if certificates.is_empty() {
+            return Err(DnsProxyError::Certificate(
+                CertificateError::InvalidFormat {
+                    reason: "Upstream CA bundle contains no certificates".to_string(),
+                },
+            ));
+        }
+        for certificate in certificates {
+            roots.add(certificate).map_err(|error| {
+                DnsProxyError::Certificate(CertificateError::InvalidFormat {
+                    reason: format!("Failed to add upstream CA certificate: {error}"),
+                })
+            })?;
+        }
+    }
+    Ok(roots)
+}
+
+/// Load the trust store owned by one application instance.  It is deliberately
+/// not process-global: rebuilding an App after rotating a PEM at the same path
+/// must observe the new trust anchor.
+pub fn load_upstream_root_store(
+    upstream_ca_file: Option<&str>,
+) -> DnsProxyResult<Arc<rustls::RootCertStore>> {
+    Ok(Arc::new(create_upstream_root_store(upstream_ca_file)?))
+}
+
 pub struct CertificateResolver {
     certs: std::collections::HashMap<String, Arc<CertifiedKey>>,
     default: Option<Arc<CertifiedKey>>,

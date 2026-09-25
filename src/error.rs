@@ -20,6 +20,14 @@ pub enum DnsProxyError {
     #[error("Upstream connection error: {0}")]
     Upstream(#[from] UpstreamError),
 
+    /// Upstream did not make progress before the configured deadline.
+    #[error("Upstream timeout: {upstream}")]
+    Timeout { upstream: String },
+
+    /// Bounded shared resources cannot accept another upstream authority.
+    #[error("{protocol} upstream pool is overloaded for {upstream}")]
+    Overloaded { upstream: String, protocol: String },
+
     /// Network I/O errors
     #[error("Network I/O error: {0}")]
     Io(#[from] std::io::Error),

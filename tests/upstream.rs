@@ -25,7 +25,7 @@ fn test_upstream_module_imports() {
     // Test that upstream module exports are accessible
     // Verify the module structure exists
     let pool = create_connection_pool_with_limit(16);
-    let _client = pool.get_client("example.com");
+    let _client = pool.get_client("example.com").unwrap();
     assert!(std::any::type_name::<HttpClient>().contains("Client"));
     assert!(std::any::type_name::<ConnectionPool>().contains("ConnectionPool"));
 }

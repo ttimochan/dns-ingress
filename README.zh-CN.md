@@ -331,6 +331,9 @@ max_upstream_pool_entries = 256
 transaction_timeout_seconds = 30
 
 [tls]
+# 可选：验证私有 PKI 重写上游时追加的 PEM 根证书包。
+# 它只影响出站信任，不启用入站 mTLS。
+# upstream_ca_file = "/path/to/private-upstream-ca.pem"
 # 默认证书配置（可选，当没有找到域名特定证书时使用）
 [tls.default]
 cert_file = "/path/to/default-cert.pem"
@@ -392,6 +395,8 @@ authority 与协议建立键；DoQ 与 DoH3 会复用 QUIC 会话。
 - **`[tls.certs.<domain>]`**: 域名特定的证书配置
   - **`cert_file`**: 证书文件路径（PEM 格式）
   - **`key_file`**: 私钥文件路径（PEM 格式）
+- **`upstream_ca_file`**: 可选 PEM 根证书包；验证重写后的私有 PKI 上游时
+  追加到公共根证书，且不配置客户端认证。应用启动时加载一次；轮换后需要重启。
 
 #### `[logging]` - 日志配置
 

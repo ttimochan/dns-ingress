@@ -3,6 +3,7 @@ use crate::error::DnsProxyResult;
 use crate::metrics::{Metrics, Timer};
 use crate::quic::{QuicApplication, create_quic_server_endpoint};
 use crate::rewrite::SniRewriterType;
+use crate::tasks::TaskGroup;
 use crate::upstream::QuicConnectionPool;
 use crate::upstream::forward_quic_stream;
 use std::net::SocketAddr;
@@ -17,18 +18,38 @@ pub struct DoQServer {
     rewriter: SniRewriterType,
     metrics: Arc<Metrics>,
     pool: Arc<QuicConnectionPool>,
+    tasks: TaskGroup,
 }
 
 impl DoQServer {
+    #[allow(dead_code)] // retained for standalone reader construction
     pub fn new(config: Arc<AppConfig>, rewriter: SniRewriterType, metrics: Arc<Metrics>) -> Self {
+        let root_store =
+            crate::tls_utils::load_upstream_root_store(config.tls.upstream_ca_file.as_deref())
+                .expect("standalone DoQ server requires a valid upstream trust store");
+        Self::with_root_store(config, rewriter, metrics, root_store)
+    }
+
+    pub(crate) fn with_root_store(
+        config: Arc<AppConfig>,
+        rewriter: SniRewriterType,
+        metrics: Arc<Metrics>,
+        root_store: Arc<rustls::RootCertStore>,
+    ) -> Self {
         Self {
-            pool: Arc::new(QuicConnectionPool::new(
+            pool: Arc::new(QuicConnectionPool::with_root_store(
                 config.limits.max_upstream_pool_entries,
+                root_store,
             )),
             config,
             rewriter,
             metrics,
+            tasks: TaskGroup::default(),
         }
+    }
+
+    pub(crate) fn task_group(&self) -> TaskGroup {
+        self.tasks.clone()
     }
 
     #[allow(dead_code)]
@@ -88,19 +109,31 @@ impl DoQServer {
                 conn = endpoint.accept() => conn,
             };
             let Some(conn) = conn else { break };
-            let permit = Arc::clone(&connection_limit)
-                .acquire_owned()
-                .await
-                .map_err(|_| {
+            let permit = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                permit = Arc::clone(&connection_limit).acquire_owned() => permit.map_err(|_| {
                     crate::error::DnsProxyError::Protocol("DoQ listener stopped".into())
-                })?;
+                })?,
+            };
             let rewriter = Arc::clone(&rewriter);
             let m = Arc::clone(&metrics);
             let pool = Arc::clone(&pool);
             let connection_shutdown = shutdown.clone();
-            tokio::spawn(async move {
+            let tasks = self.tasks.clone();
+            let connection_tasks = tasks.clone();
+            tasks.spawn(async move {
                 let _permit = permit;
-                match conn.await {
+                let connected = tokio::select! {
+                    _ = connection_shutdown.cancelled() => return,
+                    connected = tokio::time::timeout(transaction_timeout, conn) => match connected {
+                        Ok(connection) => connection,
+                        Err(_) => {
+                            error!("DoQ connection handshake timed out");
+                            return;
+                        }
+                    },
+                };
+                match connected {
                     Ok(connection) => {
                         info!("New DoQ connection from {}", connection.remote_address());
                         let remote_addr = connection.remote_address();
@@ -113,6 +146,7 @@ impl DoQServer {
                             connection_shutdown.clone(),
                             pool,
                             m,
+                            connection_tasks,
                         )
                         .await
                         {
@@ -128,9 +162,12 @@ impl DoQServer {
                         error!("DoQ connection establishment error: {}", e);
                     }
                 }
-            });
+            }).await;
         }
 
+        self.tasks
+            .close_and_wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
         Ok(())
     }
 
@@ -144,6 +181,7 @@ impl DoQServer {
         shutdown: CancellationToken,
         pool: Arc<QuicConnectionPool>,
         metrics: Arc<Metrics>,
+        tasks: TaskGroup,
     ) -> DnsProxyResult<()> {
         let handshake = connection.handshake_data().ok_or_else(|| {
             crate::error::DnsProxyError::InvalidInput("DoQ requires TLS SNI hostname".to_string())
@@ -170,15 +208,19 @@ impl DoQServer {
 
         let unidirectional = connection.clone();
         let uni_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let accepted = tokio::select! {
-                _ = uni_shutdown.cancelled() => return,
-                accepted = unidirectional.accept_uni() => accepted,
-            };
-            if accepted.is_ok() {
-                unidirectional.close(quinn::VarInt::from_u32(0x2), b"DoQ unidirectional stream");
-            }
-        });
+        let uni_tasks = tasks.clone();
+        uni_tasks
+            .spawn(async move {
+                let accepted = tokio::select! {
+                    _ = uni_shutdown.cancelled() => return,
+                    accepted = unidirectional.accept_uni() => accepted,
+                };
+                if accepted.is_ok() {
+                    unidirectional
+                        .close(quinn::VarInt::from_u32(0x2), b"DoQ unidirectional stream");
+                }
+            })
+            .await;
 
         let stream_limit = Arc::new(Semaphore::new(max_streams));
         loop {
@@ -188,53 +230,58 @@ impl DoQServer {
             };
             match accepted {
                 Ok((send, recv)) => {
-                    let permit = Arc::clone(&stream_limit)
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| {
+                    let permit = tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        permit = Arc::clone(&stream_limit).acquire_owned() => permit.map_err(|_| {
                             crate::error::DnsProxyError::Protocol("DoQ connection stopped".into())
-                        })?;
+                        })?,
+                    };
                     let target = target.clone();
                     let metrics = Arc::clone(&metrics);
                     let close_connection = connection.clone();
                     let shutdown = shutdown.clone();
                     let pool = Arc::clone(&pool);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let timer = Timer::start();
-                        let forwarding = forward_quic_stream(
-                            send,
-                            recv,
-                            &target,
-                            upstream_port,
-                            &pool,
-                            transaction_timeout,
-                        );
-                        let result = tokio::select! {
-                            _ = shutdown.cancelled() => return,
-                            result = forwarding => result,
-                        };
-                        match result {
-                            Ok((bytes_received, bytes_sent)) => metrics.record_request(
-                                true,
-                                bytes_received,
-                                bytes_sent,
-                                timer.elapsed(),
-                            ),
-                            Err(error) => {
-                                error!(
-                                    "DoQ stream forwarding error to upstream {}:{}: {}",
-                                    target, upstream_port, error
-                                );
-                                metrics.record_request(false, 0, 0, timer.elapsed());
-                                metrics.record_upstream_error();
-                                if matches!(error, crate::error::DnsProxyError::Protocol(_)) {
-                                    close_connection
-                                        .close(quinn::VarInt::from_u32(0x2), b"DoQ protocol error");
+                    let stream_tasks = tasks.clone();
+                    stream_tasks
+                        .spawn(async move {
+                            let _permit = permit;
+                            let timer = Timer::start();
+                            let forwarding = forward_quic_stream(
+                                send,
+                                recv,
+                                &target,
+                                upstream_port,
+                                &pool,
+                                transaction_timeout,
+                            );
+                            let result = tokio::select! {
+                                _ = shutdown.cancelled() => return,
+                                result = forwarding => result,
+                            };
+                            match result {
+                                Ok((bytes_received, bytes_sent)) => metrics.record_request(
+                                    true,
+                                    bytes_received,
+                                    bytes_sent,
+                                    timer.elapsed(),
+                                ),
+                                Err(error) => {
+                                    error!(
+                                        "DoQ stream forwarding error to upstream {}:{}: {}",
+                                        target, upstream_port, error
+                                    );
+                                    metrics.record_request(false, 0, 0, timer.elapsed());
+                                    metrics.record_upstream_error();
+                                    if matches!(error, crate::error::DnsProxyError::Protocol(_)) {
+                                        close_connection.close(
+                                            quinn::VarInt::from_u32(0x2),
+                                            b"DoQ protocol error",
+                                        );
+                                    }
                                 }
                             }
-                        }
-                    });
+                        })
+                        .await;
                 }
                 Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
                     info!("DoQ connection closed");

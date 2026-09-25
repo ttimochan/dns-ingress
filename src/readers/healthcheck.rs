@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::error::DnsProxyResult;
 use crate::metrics::Metrics;
+use crate::tasks::TaskGroup;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -18,6 +19,7 @@ pub struct HealthcheckServer {
     config: Arc<AppConfig>,
     metrics: Arc<Metrics>,
     ready: Arc<AtomicBool>,
+    tasks: TaskGroup,
 }
 
 impl HealthcheckServer {
@@ -30,7 +32,12 @@ impl HealthcheckServer {
             config,
             metrics,
             ready,
+            tasks: TaskGroup::default(),
         }
+    }
+
+    pub(crate) fn task_group(&self) -> TaskGroup {
+        self.tasks.clone()
     }
 
     #[allow(dead_code)]
@@ -89,53 +96,62 @@ impl HealthcheckServer {
             };
             match accepted {
                 Ok((stream, addr)) => {
-                    let permit = match Arc::clone(&connection_limit).acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => break,
+                    let permit = tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        permit = Arc::clone(&connection_limit).acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        },
                     };
                     let path = healthcheck_path.clone();
                     let metrics = Arc::clone(&metrics);
                     let ready = Arc::clone(&ready);
                     let client_addr = addr;
                     let shutdown = shutdown.clone();
-                    tokio::spawn(async move {
-                        let _connection_permit = permit;
-                        let io = TokioIo::new(stream);
-                        let service = service_fn(move |req| {
-                            let path = path.clone();
-                            let addr = client_addr;
-                            let metrics = Arc::clone(&metrics);
-                            let ready = Arc::clone(&ready);
-                            async move {
-                                handle_healthcheck(
-                                    req,
-                                    &path,
-                                    &metrics,
-                                    ready.load(Ordering::Relaxed),
-                                )
-                                .await
-                                .map_err(|e| {
-                                    error!("Healthcheck handler error from {}: {}", addr, e);
-                                    std::io::Error::other(e.to_string())
-                                })
-                            }
-                        });
+                    let tasks = self.tasks.clone();
+                    tasks
+                        .spawn(async move {
+                            let _connection_permit = permit;
+                            let io = TokioIo::new(stream);
+                            let service = service_fn(move |req| {
+                                let path = path.clone();
+                                let addr = client_addr;
+                                let metrics = Arc::clone(&metrics);
+                                let ready = Arc::clone(&ready);
+                                async move {
+                                    handle_healthcheck(
+                                        req,
+                                        &path,
+                                        &metrics,
+                                        ready.load(Ordering::Relaxed),
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        error!("Healthcheck handler error from {}: {}", addr, e);
+                                        std::io::Error::other(e.to_string())
+                                    })
+                                }
+                            });
 
-                        let connection = http1::Builder::new().serve_connection(io, service);
-                        let result = tokio::select! {
-                            _ = shutdown.cancelled() => Ok(()),
-                            result = connection => result,
-                        };
-                        if let Err(e) = result {
-                            error!("Healthcheck connection error from {}: {}", client_addr, e);
-                        }
-                    });
+                            let connection = http1::Builder::new().serve_connection(io, service);
+                            let result = tokio::select! {
+                                _ = shutdown.cancelled() => Ok(()),
+                                result = connection => result,
+                            };
+                            if let Err(e) = result {
+                                error!("Healthcheck connection error from {}: {}", client_addr, e);
+                            }
+                        })
+                        .await;
                 }
                 Err(e) => {
                     error!("Healthcheck accept error: {}", e);
                 }
             }
         }
+        self.tasks
+            .close_and_wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
         Ok(())
     }
 }

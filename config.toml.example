@@ -69,6 +69,10 @@ max_upstream_pool_entries = 256
 transaction_timeout_seconds = 30
 
 [tls]
+# Optional PEM bundle appended to public roots when validating rewritten
+# upstreams. This is outbound trust only; it does not enable inbound mTLS.
+# The bundle is loaded at startup; restart after rotating it.
+# upstream_ca_file = "/path/to/private-upstream-ca.pem"
 # Default certificate configuration (optional)
 # Used when no domain-specific certificate is configured
 [tls.default]

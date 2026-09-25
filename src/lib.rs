@@ -9,6 +9,7 @@ pub mod rewrite;
 pub mod rewriters;
 pub mod server;
 pub mod sni;
+pub mod tasks;
 pub mod tls_utils;
 pub mod upstream;
 pub mod utils;

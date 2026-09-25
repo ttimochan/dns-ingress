@@ -1,3 +1,4 @@
+use anyhow::Result;
 use dashmap::DashMap;
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -22,6 +23,7 @@ pub struct ConnectionPool {
     connection_timeout: Duration,
     max_idle_connections: usize,
     max_clients: usize,
+    root_store: Arc<rustls::RootCertStore>,
 }
 
 impl ConnectionPool {
@@ -33,9 +35,22 @@ impl ConnectionPool {
         )
     }
 
+    #[allow(dead_code)] // retained as the public default-trust constructor
     pub fn with_max_clients(max_clients: usize) -> Self {
+        Self::with_max_clients_and_root_store(
+            max_clients,
+            crate::tls_utils::load_upstream_root_store(None)
+                .expect("platform trust store must be available"),
+        )
+    }
+
+    pub fn with_max_clients_and_root_store(
+        max_clients: usize,
+        root_store: Arc<rustls::RootCertStore>,
+    ) -> Self {
         let mut pool = Self::new();
         pool.max_clients = max_clients;
+        pool.root_store = root_store;
         pool
     }
 
@@ -50,13 +65,15 @@ impl ConnectionPool {
             connection_timeout,
             max_idle_connections,
             max_clients: DEFAULT_MAX_CLIENTS,
+            root_store: crate::tls_utils::load_upstream_root_store(None)
+                .expect("platform trust store must be available"),
         }
     }
 
-    pub fn get_client(&self, sni: &str) -> Arc<HttpClient> {
+    pub fn get_client(&self, sni: &str) -> Result<Arc<HttpClient>> {
         if let Some(client) = self.clients.get(sni) {
             debug!("Reusing existing HTTP client for SNI: {}", sni);
-            return Arc::clone(client.value());
+            return Ok(Arc::clone(client.value()));
         }
 
         debug!("Creating new HTTP client for SNI: {}", sni);
@@ -68,35 +85,39 @@ impl ConnectionPool {
                 self.clients.remove(&key);
             }
         }
-        let client = self.create_client();
+        let client = self.create_client()?;
         let client_arc = Arc::new(client);
 
         self.clients
             .entry(sni.to_string())
             .or_insert_with(|| Arc::clone(&client_arc));
 
-        self.clients
+        Ok(self
+            .clients
             .get(sni)
             .map(|entry| Arc::clone(entry.value()))
-            .unwrap_or(client_arc)
+            .unwrap_or(client_arc))
     }
 
-    fn create_client(&self) -> HttpClient {
+    fn create_client(&self) -> Result<HttpClient> {
         let mut http_connector = HttpConnector::new();
         http_connector.set_keepalive(Some(self.keepalive_timeout));
         http_connector.set_connect_timeout(Some(self.connection_timeout));
 
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates((*self.root_store).clone())
+            .with_no_client_auth();
         let https_connector = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
+            .with_tls_config(tls_config)
             .https_or_http()
             .enable_http2()
             .wrap_connector(http_connector);
 
-        Client::builder(TokioExecutor::new())
+        Ok(Client::builder(TokioExecutor::new())
             .pool_max_idle_per_host(self.max_idle_connections)
             .pool_idle_timeout(self.keepalive_timeout)
             .set_host(false)
-            .build(https_connector)
+            .build(https_connector))
     }
 }
 

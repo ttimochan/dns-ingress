@@ -80,6 +80,23 @@ fn test_upstream_config() {
 }
 
 #[test]
+fn test_upstream_ca_file_must_exist_and_contain_certificates() {
+    let mut config = AppConfig::default();
+    config.servers.dot.enabled = false;
+    config.servers.doh.enabled = false;
+    config.servers.doq.enabled = false;
+    config.servers.doh3.enabled = false;
+    config.servers.healthcheck.enabled = false;
+
+    config.tls.upstream_ca_file = Some("/definitely/missing/upstream-ca.pem".to_string());
+    assert!(config.validate().is_err());
+
+    let ca = NamedTempFile::new().unwrap();
+    config.tls.upstream_ca_file = Some(ca.path().display().to_string());
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn test_tcp_and_udp_may_share_dns_port() {
     let mut config = AppConfig::default();
     config.servers.doh.enabled = false;

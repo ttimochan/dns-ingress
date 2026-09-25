@@ -34,16 +34,29 @@ pub async fn forward_quic_stream(
     .await
     .map_err(|_| doq_idle_timeout("opening upstream connection"))??;
 
-    let (mut upstream_send, mut upstream_recv) =
-        tokio::time::timeout(idle_timeout, upstream_conn.connection.open_bi())
-            .await
-            .map_err(|_| doq_idle_timeout("opening upstream stream"))?
-            .map_err(|error| {
-                DnsProxyError::Upstream(crate::error::UpstreamError::RequestFailed {
+    let (mut upstream_send, mut upstream_recv) = match tokio::time::timeout(
+        idle_timeout,
+        upstream_conn.connection().connection.open_bi(),
+    )
+    .await
+    {
+        Ok(Ok(streams)) => streams,
+        Ok(Err(error)) => {
+            pool.invalidate(QuicApplication::Doq, server_name, upstream_port)
+                .await;
+            return Err(DnsProxyError::Upstream(
+                crate::error::UpstreamError::RequestFailed {
                     upstream: format!("{}:{}", server_name, upstream_port),
                     reason: format!("Failed to open DoQ stream: {error}"),
-                })
-            })?;
+                },
+            ));
+        }
+        Err(_) => {
+            pool.invalidate(QuicApplication::Doq, server_name, upstream_port)
+                .await;
+            return Err(doq_idle_timeout("opening upstream stream"));
+        }
+    };
     write_doq_frame(&mut upstream_send, &query, idle_timeout).await?;
     upstream_send.finish().map_err(|error| {
         DnsProxyError::Upstream(crate::error::UpstreamError::RequestFailed {
@@ -148,10 +161,9 @@ async fn write_doq_frame(
 }
 
 fn doq_idle_timeout(operation: &str) -> DnsProxyError {
-    DnsProxyError::Upstream(crate::error::UpstreamError::RequestFailed {
-        upstream: "DoQ transaction".to_string(),
-        reason: format!("idle timeout while {operation}"),
-    })
+    DnsProxyError::Timeout {
+        upstream: format!("DoQ transaction ({operation})"),
+    }
 }
 
 /// Forward a DoH request over HTTP/3. DoH3 callers must never downgrade this
@@ -169,11 +181,8 @@ pub async fn forward_http3_request(
 ) -> DnsProxyResult<(Response<http_body_util::Full<Bytes>>, u64)> {
     let session = tokio::time::timeout(timeout, pool.get(target_hostname, port))
         .await
-        .map_err(|_| {
-            DnsProxyError::Upstream(crate::error::UpstreamError::RequestFailed {
-                upstream: format!("{}:{}", target_hostname, port),
-                reason: "HTTP/3 upstream connection timed out".to_string(),
-            })
+        .map_err(|_| DnsProxyError::Timeout {
+            upstream: format!("{}:{}", target_hostname, port),
         })??;
     let mut sender = session.sender();
 
@@ -194,30 +203,43 @@ pub async fn forward_http3_request(
                 DnsProxyError::Protocol(format!("Invalid upstream Host header: {error}"))
             })?,
         );
-        let mut stream = sender.send_request(request).await.map_err(|error| {
-            DnsProxyError::Upstream(crate::error::UpstreamError::RequestFailed {
+        let mut stream = tokio::time::timeout(timeout, sender.send_request(request))
+            .await
+            .map_err(|_| DnsProxyError::Timeout {
                 upstream: upstream_uri.to_string(),
-                reason: error.to_string(),
-            })
-        })?;
+            })?
+            .map_err(|error| {
+                DnsProxyError::Upstream(crate::error::UpstreamError::RequestFailed {
+                    upstream: upstream_uri.to_string(),
+                    reason: error.to_string(),
+                })
+            })?;
         if !body.is_empty() {
-            stream
-                .send_data(body)
+            tokio::time::timeout(timeout, stream.send_data(body))
                 .await
+                .map_err(|_| DnsProxyError::Timeout {
+                    upstream: upstream_uri.to_string(),
+                })?
                 .map_err(|error| DnsProxyError::Protocol(error.to_string()))?;
         }
-        stream
-            .finish()
+        tokio::time::timeout(timeout, stream.finish())
             .await
+            .map_err(|_| DnsProxyError::Timeout {
+                upstream: upstream_uri.to_string(),
+            })?
             .map_err(|error| DnsProxyError::Protocol(error.to_string()))?;
-        let response = stream
-            .recv_response()
+        let response = tokio::time::timeout(timeout, stream.recv_response())
             .await
+            .map_err(|_| DnsProxyError::Timeout {
+                upstream: upstream_uri.to_string(),
+            })?
             .map_err(|error| DnsProxyError::Protocol(error.to_string()))?;
         let mut response_body = Vec::new();
-        while let Some(chunk) = stream
-            .recv_data()
+        while let Some(chunk) = tokio::time::timeout(timeout, stream.recv_data())
             .await
+            .map_err(|_| DnsProxyError::Timeout {
+                upstream: upstream_uri.to_string(),
+            })?
             .map_err(|error| DnsProxyError::Protocol(error.to_string()))?
         {
             if response_body.len().saturating_add(chunk.remaining()) > MAX_DNS_MESSAGE_SIZE {
@@ -260,10 +282,9 @@ pub async fn forward_http3_request(
             length,
         ))
     };
-    tokio::time::timeout(timeout, request).await.map_err(|_| {
-        DnsProxyError::Upstream(crate::error::UpstreamError::RequestFailed {
-            upstream: upstream_uri.to_string(),
-            reason: "HTTP/3 transaction timed out without I/O progress".to_string(),
-        })
-    })?
+    let result = request.await;
+    if result.is_err() {
+        pool.invalidate(target_hostname, port).await;
+    }
+    result
 }

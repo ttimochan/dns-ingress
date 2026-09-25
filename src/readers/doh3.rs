@@ -7,6 +7,7 @@ use crate::proxy::http::{
 use crate::quic::{QuicApplication, create_quic_server_endpoint};
 use crate::rewrite::SniRewriterType;
 use crate::sni::SniRewriter;
+use crate::tasks::TaskGroup;
 use crate::upstream::Http3ConnectionPool;
 use crate::upstream::forward_http3_request;
 use bytes::{Buf, Bytes};
@@ -26,18 +27,38 @@ pub struct DoH3Server {
     rewriter: SniRewriterType,
     metrics: Arc<Metrics>,
     pool: Arc<Http3ConnectionPool>,
+    tasks: TaskGroup,
 }
 
 impl DoH3Server {
+    #[allow(dead_code)] // retained for standalone reader construction
     pub fn new(config: Arc<AppConfig>, rewriter: SniRewriterType, metrics: Arc<Metrics>) -> Self {
+        let root_store =
+            crate::tls_utils::load_upstream_root_store(config.tls.upstream_ca_file.as_deref())
+                .expect("standalone DoH3 server requires a valid upstream trust store");
+        Self::with_root_store(config, rewriter, metrics, root_store)
+    }
+
+    pub(crate) fn with_root_store(
+        config: Arc<AppConfig>,
+        rewriter: SniRewriterType,
+        metrics: Arc<Metrics>,
+        root_store: Arc<rustls::RootCertStore>,
+    ) -> Self {
         Self {
-            pool: Arc::new(Http3ConnectionPool::new(
+            pool: Arc::new(Http3ConnectionPool::with_root_store(
                 config.limits.max_upstream_pool_entries,
+                root_store,
             )),
             config,
             rewriter,
             metrics,
+            tasks: TaskGroup::default(),
         }
+    }
+
+    pub(crate) fn task_group(&self) -> TaskGroup {
+        self.tasks.clone()
     }
 
     #[allow(dead_code)]
@@ -99,9 +120,12 @@ impl DoH3Server {
                 conn = endpoint.accept() => conn,
             };
             let Some(conn) = conn else { break };
-            let permit = match Arc::clone(&connection_limit).acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => break,
+            let permit = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                permit = Arc::clone(&connection_limit).acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
             };
             let rewriter = Arc::clone(&rewriter);
             let metrics = Arc::clone(&metrics);
@@ -109,9 +133,21 @@ impl DoH3Server {
             let request_path = request_path.clone();
             let pool = Arc::clone(&pool);
             let shutdown = shutdown.clone();
-            tokio::spawn(async move {
+            let tasks = self.tasks.clone();
+            let connection_tasks = tasks.clone();
+            tasks.spawn(async move {
                 let _connection_permit = permit;
-                match conn.await {
+                let connected = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    connected = tokio::time::timeout(transaction_timeout, conn) => match connected {
+                        Ok(connection) => connection,
+                        Err(_) => {
+                            error!("DoH3 connection handshake timed out");
+                            return;
+                        }
+                    },
+                };
+                match connected {
                     Ok(connection) => {
                         let remote_addr = connection.remote_address();
                         info!("New DoH3 connection from {}", remote_addr);
@@ -126,6 +162,7 @@ impl DoH3Server {
                             transaction_timeout,
                             shutdown,
                             pool,
+                            connection_tasks,
                         )
                         .await
                         {
@@ -142,9 +179,12 @@ impl DoH3Server {
                         error!("DoH3 connection establishment error: {}", e);
                     }
                 }
-            });
+            }).await;
         }
 
+        self.tasks
+            .close_and_wait_until(tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await;
         Ok(())
     }
 
@@ -159,6 +199,7 @@ impl DoH3Server {
         transaction_timeout: std::time::Duration,
         shutdown: CancellationToken,
         pool: Arc<Http3ConnectionPool>,
+        tasks: TaskGroup,
     ) -> DnsProxyResult<()> {
         let tls_sni = connection
             .handshake_data()
@@ -168,11 +209,15 @@ impl DoH3Server {
                 DnsProxyError::InvalidInput("DoH3 requires TLS SNI hostname".to_string())
             })?;
         // Create H3 connection from quinn connection
-        let mut conn = H3ServerConnection::new(h3_quinn::Connection::new(connection))
-            .await
-            .map_err(|e| {
-                DnsProxyError::Protocol(format!("Failed to create H3 connection: {}", e))
-            })?;
+        let mut conn = tokio::time::timeout(
+            transaction_timeout,
+            H3ServerConnection::new(h3_quinn::Connection::new(connection)),
+        )
+        .await
+        .map_err(|_| DnsProxyError::Timeout {
+            upstream: "DoH3 client control stream".to_string(),
+        })?
+        .map_err(|e| DnsProxyError::Protocol(format!("Failed to create H3 connection: {}", e)))?;
 
         let stream_limit = Arc::new(Semaphore::new(max_streams));
         loop {
@@ -182,9 +227,12 @@ impl DoH3Server {
             };
             match accepted {
                 Ok(Some(resolver)) => {
-                    let permit = match Arc::clone(&stream_limit).acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => break,
+                    let permit = tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        permit = Arc::clone(&stream_limit).acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        },
                     };
                     let rewriter = Arc::clone(&rewriter);
                     let metrics = Arc::clone(&metrics);
@@ -193,35 +241,42 @@ impl DoH3Server {
                     let tls_sni = tls_sni.clone();
                     let shutdown = shutdown.clone();
                     let pool = Arc::clone(&pool);
-                    tokio::spawn(async move {
-                        let _request_permit = permit;
-                        // Resolve the request
-                        match resolver.resolve_request().await {
-                            Ok((req, stream)) => {
-                                if let Err(e) = Self::handle_request(
-                                    req,
-                                    stream,
-                                    rewriter,
-                                    metrics,
-                                    endpoint,
-                                    &request_path,
-                                    &tls_sni,
-                                    transaction_timeout,
-                                    shutdown,
-                                    pool,
-                                )
-                                .await
-                                {
-                                    error!("DoH3 request handling error: {}", e);
-                                } else {
-                                    debug!("DoH3 request handled successfully");
+                    let request_tasks = tasks.clone();
+                    request_tasks
+                        .spawn(async move {
+                            let _request_permit = permit;
+                            // Resolve the request
+                            let resolved = tokio::select! {
+                                _ = shutdown.cancelled() => return,
+                                resolved = resolver.resolve_request() => resolved,
+                            };
+                            match resolved {
+                                Ok((req, stream)) => {
+                                    if let Err(e) = Self::handle_request(
+                                        req,
+                                        stream,
+                                        rewriter,
+                                        metrics,
+                                        endpoint,
+                                        &request_path,
+                                        &tls_sni,
+                                        transaction_timeout,
+                                        shutdown,
+                                        pool,
+                                    )
+                                    .await
+                                    {
+                                        error!("DoH3 request handling error: {}", e);
+                                    } else {
+                                        debug!("DoH3 request handled successfully");
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("DoH3 request resolution error: {}", e);
                                 }
                             }
-                            Err(e) => {
-                                error!("DoH3 request resolution error: {}", e);
-                            }
-                        }
-                    });
+                        })
+                        .await;
                 }
                 Ok(None) => {
                     // Connection closed
@@ -376,7 +431,16 @@ impl DoH3Server {
         let body = if *req.method() == Method::POST {
             let mut body_data = Vec::new();
             loop {
-                match stream.recv_data().await {
+                let received = tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(()),
+                    received = tokio::time::timeout(transaction_timeout, stream.recv_data()) => match received {
+                        Ok(received) => received,
+                        Err(_) => return Err(DnsProxyError::Timeout {
+                            upstream: "DoH3 request body".to_string(),
+                        }),
+                    },
+                };
+                match received {
                     Ok(Some(mut chunk)) => {
                         if body_data.len().saturating_add(chunk.remaining()) > MAX_DNS_MESSAGE_SIZE
                         {
@@ -461,17 +525,32 @@ impl DoH3Server {
                 DnsProxyError::Protocol(format!("Failed to read upstream DoH3 body: {}", e))
             })?
             .to_bytes();
-        stream
-            .send_response(hyper::Response::from_parts(parts, ()))
+        tokio::time::timeout(
+            transaction_timeout,
+            stream.send_response(hyper::Response::from_parts(parts, ())),
+        )
+        .await
+        .map_err(|_| DnsProxyError::Timeout {
+            upstream: "DoH3 client response headers".to_string(),
+        })?
+        .map_err(|e| DnsProxyError::Protocol(format!("Failed to send DoH3 response: {}", e)))?;
+        tokio::time::timeout(transaction_timeout, stream.send_data(response_body))
             .await
-            .map_err(|e| DnsProxyError::Protocol(format!("Failed to send DoH3 response: {}", e)))?;
-        stream.send_data(response_body).await.map_err(|e| {
-            DnsProxyError::Protocol(format!("Failed to send DoH3 response body: {}", e))
-        })?;
+            .map_err(|_| DnsProxyError::Timeout {
+                upstream: "DoH3 client response body".to_string(),
+            })?
+            .map_err(|e| {
+                DnsProxyError::Protocol(format!("Failed to send DoH3 response body: {}", e))
+            })?;
 
-        stream.finish().await.map_err(|e| {
-            DnsProxyError::Protocol(format!("Failed to finish DoH3 response: {}", e))
-        })?;
+        tokio::time::timeout(transaction_timeout, stream.finish())
+            .await
+            .map_err(|_| DnsProxyError::Timeout {
+                upstream: "DoH3 client response finish".to_string(),
+            })?
+            .map_err(|e| {
+                DnsProxyError::Protocol(format!("Failed to finish DoH3 response: {}", e))
+            })?;
 
         Ok(())
     }
@@ -489,6 +568,10 @@ impl DoH3Server {
             hyper::StatusCode::UNSUPPORTED_MEDIA_TYPE
         } else if message.contains("exceeds") || message.contains("65535 bytes") {
             hyper::StatusCode::PAYLOAD_TOO_LARGE
+        } else if matches!(error, DnsProxyError::Timeout { .. }) {
+            hyper::StatusCode::GATEWAY_TIMEOUT
+        } else if matches!(error, DnsProxyError::Overloaded { .. }) {
+            hyper::StatusCode::SERVICE_UNAVAILABLE
         } else if matches!(error, DnsProxyError::Upstream(_)) {
             hyper::StatusCode::BAD_GATEWAY
         } else {
