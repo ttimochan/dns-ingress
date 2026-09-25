@@ -8,14 +8,17 @@ fn create_test_rewriter() -> dns_ingress::rewrite::SniRewriterType {
     create_rewriter(RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     })
 }
 
 #[test]
 fn test_healthcheck_server_new() {
     let config = Arc::new(AppConfig::default());
-    let _server = HealthcheckServer::new(config);
+    let _server = HealthcheckServer::with_metrics_and_readiness(
+        config,
+        Arc::new(Metrics::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
 }
 
 #[test]
@@ -55,7 +58,11 @@ async fn test_healthcheck_server_start_disabled() {
     let mut config = AppConfig::default();
     config.servers.healthcheck.enabled = false;
     let config = Arc::new(config);
-    let server = HealthcheckServer::new(config);
+    let server = HealthcheckServer::with_metrics_and_readiness(
+        config,
+        Arc::new(Metrics::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
 
     let result = server.start().await;
     assert!(result.is_ok());

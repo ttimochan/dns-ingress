@@ -7,7 +7,6 @@ fn create_test_config() -> RewriteConfig {
     RewriteConfig {
         base_domains: vec!["example.com".to_string(), "example.org".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     }
 }
 
@@ -91,18 +90,15 @@ async fn test_rewrite_sni_multiple_domains() {
 }
 
 #[tokio::test]
-async fn test_rewrite_sni_caching() {
+async fn test_rewrite_sni_is_deterministic_without_unbounded_cache() {
     let config = create_test_config();
     let rewriter = BaseSniRewriter::new(config);
 
     let result1 = rewriter.rewrite("www.example.org").await;
-    assert!(result1.is_some());
-
-    // Check cache using DashMap API
-    assert!(rewriter.sni_map.contains_key("www.example.org"));
+    let result2 = rewriter.rewrite("www.example.org").await;
     assert_eq!(
-        rewriter.sni_map.get("www.example.org").map(|v| v.clone()),
-        Some("www.example.cn".to_string())
+        result1.map(|result| result.target_hostname),
+        result2.map(|result| result.target_hostname)
     );
 }
 

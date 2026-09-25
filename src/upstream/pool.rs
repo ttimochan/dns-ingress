@@ -12,6 +12,7 @@ use tracing::debug;
 const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_IDLE_CONNECTIONS: usize = 10;
+const DEFAULT_MAX_CLIENTS: usize = 256;
 
 pub type HttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
@@ -20,6 +21,7 @@ pub struct ConnectionPool {
     keepalive_timeout: Duration,
     connection_timeout: Duration,
     max_idle_connections: usize,
+    max_clients: usize,
 }
 
 impl ConnectionPool {
@@ -29,6 +31,12 @@ impl ConnectionPool {
             DEFAULT_CONNECTION_TIMEOUT,
             DEFAULT_MAX_IDLE_CONNECTIONS,
         )
+    }
+
+    pub fn with_max_clients(max_clients: usize) -> Self {
+        let mut pool = Self::new();
+        pool.max_clients = max_clients;
+        pool
     }
 
     pub fn with_config(
@@ -41,6 +49,7 @@ impl ConnectionPool {
             keepalive_timeout,
             connection_timeout,
             max_idle_connections,
+            max_clients: DEFAULT_MAX_CLIENTS,
         }
     }
 
@@ -51,6 +60,14 @@ impl ConnectionPool {
         }
 
         debug!("Creating new HTTP client for SNI: {}", sni);
+        if self.clients.len() >= self.max_clients {
+            // Bound attacker-controlled rewritten hostnames. HTTP clients are
+            // cheap to recreate; evicting an arbitrary idle entry is safer
+            // than retaining an unbounded authority map.
+            if let Some(key) = self.clients.iter().next().map(|entry| entry.key().clone()) {
+                self.clients.remove(&key);
+            }
+        }
         let client = self.create_client();
         let client_arc = Arc::new(client);
 
@@ -70,8 +87,7 @@ impl ConnectionPool {
         http_connector.set_connect_timeout(Some(self.connection_timeout));
 
         let https_connector = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .expect("Failed to load native root certificates")
+            .with_webpki_roots()
             .https_or_http()
             .enable_http2()
             .wrap_connector(http_connector);

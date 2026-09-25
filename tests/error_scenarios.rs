@@ -8,7 +8,6 @@ async fn test_rewriter_error_scenario_no_match() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
     let result = rewriter.rewrite("other.com").await;
@@ -23,7 +22,6 @@ async fn test_rewriter_error_scenario_invalid_format() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
@@ -57,26 +55,16 @@ async fn test_rewriter_error_scenario_invalid_format() {
 }
 
 #[tokio::test]
-async fn test_rewriter_error_scenario_passthrough_fallback() {
+async fn test_rewriter_error_scenario_rejects_unmatched_domain() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "passthrough".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
-    // Non-matching hostname should use passthrough
+    // Non-matching hostnames must never bypass the configured routing rule.
     let result = rewriter.rewrite("other.com").await;
-    assert!(result.is_some(), "Passthrough strategy should return Some");
-    let rewrite_result = result.unwrap();
-    assert_eq!(
-        rewrite_result.target_hostname, "other.com",
-        "Passthrough should preserve original hostname"
-    );
-    assert_eq!(
-        rewrite_result.prefix, "",
-        "Passthrough should have empty prefix"
-    );
+    assert!(result.is_none());
 }
 
 #[tokio::test]
@@ -85,7 +73,6 @@ async fn test_config_validation_empty_base_domains() {
     let config = RewriteConfig {
         base_domains: vec![],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
@@ -103,7 +90,6 @@ async fn test_config_validation_invalid_target_suffix() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: "example.cn".to_string(), // Missing leading dot
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
@@ -119,7 +105,6 @@ async fn test_rewriter_error_scenario_malformed_hostname() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
@@ -148,7 +133,6 @@ async fn test_rewriter_error_scenario_very_long_hostname() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
@@ -170,7 +154,6 @@ async fn test_rewriter_error_scenario_unicode_hostname() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 

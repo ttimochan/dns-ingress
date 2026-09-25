@@ -1,5 +1,6 @@
 use dns_ingress::app::App;
 use dns_ingress::config::AppConfig;
+use dns_ingress::error::DnsProxyError;
 use dns_ingress::sni::SniRewriter;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -16,7 +17,7 @@ async fn test_app_start_all_disabled() {
     assert!(config.validate().is_ok());
 
     let mut app = App::new(config);
-    assert!(app.start().is_ok());
+    assert!(app.start().await.is_ok());
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -61,17 +62,9 @@ async fn test_sni_rewrite_flow() {
 #[test]
 fn test_upstream_config_parsing() {
     let config = AppConfig::default();
-
-    let dot_upstream = config.dot_upstream();
-    assert!(dot_upstream.is_ok());
-    assert_eq!(dot_upstream.unwrap().port(), 853);
-
-    let doq_upstream = config.doq_upstream();
-    assert!(doq_upstream.is_ok());
-    assert_eq!(doq_upstream.unwrap().port(), 853);
-
-    let hostname = config.dot_upstream_hostname();
-    assert!(!hostname.is_empty());
+    assert_eq!(config.upstream.dot.port, 853);
+    assert_eq!(config.upstream.doq.port, 853);
+    assert_eq!(config.upstream.doh.path, "/dns-query");
 }
 
 #[tokio::test]
@@ -87,14 +80,27 @@ async fn test_healthcheck_server_start() {
     assert!(config.validate().is_ok());
 
     let mut app = App::new(config);
-    assert!(app.start().is_ok());
+    match app.start().await {
+        Ok(()) => {}
+        // The restricted CI sandbox used for unit tests has no socket-bind
+        // capability. Production must still fail fast for the same error.
+        Err(DnsProxyError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return;
+        }
+        Err(error) => panic!("healthcheck startup failed: {error}"),
+    }
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/health", 18080);
-
-    let _result = timeout(Duration::from_secs(1), client.get(&url).send()).await;
+    for path in ["/live", "/ready", "/health"] {
+        let url = format!("http://127.0.0.1:{}{}", 18080, path);
+        let response = timeout(Duration::from_secs(1), client.get(&url).send())
+            .await
+            .expect("healthcheck request timed out")
+            .expect("healthcheck request failed");
+        assert!(response.status().is_success(), "{} was not ready", path);
+    }
 
     app.wait_for_shutdown().await;
 }

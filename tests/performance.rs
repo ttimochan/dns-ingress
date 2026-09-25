@@ -9,7 +9,6 @@ async fn test_rewriter_performance_single() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
@@ -30,7 +29,6 @@ async fn test_rewriter_performance_concurrent() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = std::sync::Arc::new(BaseSniRewriter::new(config));
 
@@ -65,7 +63,6 @@ async fn test_rewriter_performance_sequential() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
@@ -96,7 +93,6 @@ async fn test_rewriter_performance_cache_hit() {
     let config = RewriteConfig {
         base_domains: vec!["example.com".to_string()],
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 
@@ -132,7 +128,6 @@ async fn test_rewriter_stress_many_domains() {
     let config = RewriteConfig {
         base_domains,
         target_suffix: ".example.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
     let rewriter = BaseSniRewriter::new(config);
 

@@ -6,15 +6,36 @@ use quinn::{Endpoint, ServerConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// ALPN values registered by the applicable DNS transports.
+///
+/// A QUIC listener must serve one application protocol only: accepting a DoQ
+/// connection as HTTP/3 (or the inverse) makes the first stream undecodable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuicApplication {
+    Doq,
+    H3,
+}
+
+impl QuicApplication {
+    pub const fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::Doq => b"doq",
+            Self::H3 => b"h3",
+        }
+    }
+}
+
 /// Create a QUIC server endpoint from application config
 pub async fn create_quic_server_endpoint(
     config: &AppConfig,
     bind_addr: SocketAddr,
+    application: QuicApplication,
 ) -> Result<Endpoint> {
     // Create TLS server configuration
-    let rustls_config = tls_utils::create_server_config(config)
+    let mut rustls_config = tls_utils::create_server_config(config)
         .await
         .context("Failed to create TLS server config")?;
+    rustls_config.alpn_protocols = vec![application.alpn().to_vec()];
 
     // rustls::ServerConfig is already compatible with quinn::rustls::ServerConfig
     let rustls_config_arc = Arc::new(rustls_config);

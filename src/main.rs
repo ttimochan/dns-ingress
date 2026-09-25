@@ -8,7 +8,6 @@ mod quic;
 mod readers;
 mod rewrite;
 mod rewriters;
-mod server;
 mod sni;
 mod tls_utils;
 mod upstream;
@@ -24,7 +23,8 @@ async fn main() -> Result<()> {
         .install_default()
         .map_err(|e| anyhow::anyhow!("Failed to install default crypto provider: {:?}", e))?;
 
-    let config = config::AppConfig::load_or_default("config.toml");
+    let config = config::AppConfig::from_file("config.toml")
+        .context("Failed to load required config.toml")?;
 
     config
         .validate()
@@ -36,7 +36,9 @@ async fn main() -> Result<()> {
     info!("DNS Proxy Server starting...");
 
     let mut app = app::App::new(config);
-    app.start().context("Failed to start DNS Proxy Server")?;
+    app.start()
+        .await
+        .context("Failed to start DNS Proxy Server")?;
 
     info!("DNS Proxy Server started successfully. Press Ctrl+C to shutdown.");
 

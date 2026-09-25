@@ -8,7 +8,6 @@ fn test_create_rewriter() {
     let config = RewriteConfig {
         base_domains: vec!["test.com".to_string()],
         target_suffix: ".test.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
 
     let rewriter = create_rewriter(config);
@@ -20,7 +19,6 @@ async fn test_create_rewriter_functionality() {
     let config = RewriteConfig {
         base_domains: vec!["test.com".to_string()],
         target_suffix: ".test.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     };
 
     let rewriter = create_rewriter(config);

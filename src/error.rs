@@ -4,10 +4,6 @@ use thiserror::Error;
 /// Main error type for DNS Proxy operations
 #[derive(Error, Debug)]
 pub enum DnsProxyError {
-    /// Configuration errors
-    #[error("Configuration error: {0}")]
-    Config(String),
-
     /// SNI rewrite errors
     #[error("SNI rewrite failed: {0}")]
     SniRewrite(#[from] SniRewriteError),

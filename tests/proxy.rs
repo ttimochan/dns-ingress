@@ -7,7 +7,6 @@ async fn test_rewriter_integration() {
     let rewriter = create_rewriter(RewriteConfig {
         base_domains: vec!["test.com".to_string()],
         target_suffix: ".test.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     });
 
     // Test that the rewriter works correctly
@@ -24,7 +23,6 @@ async fn test_rewriter_no_match() {
     let rewriter = create_rewriter(RewriteConfig {
         base_domains: vec!["test.com".to_string()],
         target_suffix: ".test.cn".to_string(),
-        rewrite_failure_strategy: "error".to_string(),
     });
 
     // Test with non-matching domain

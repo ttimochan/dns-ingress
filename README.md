@@ -1,5 +1,9 @@
 # DNS Ingress
 
+> **v2 migration:** upstream hostnames are always the rewritten targets.
+> Replace legacy fixed `upstream.default` and protocol URL/address values with
+> per-protocol endpoint settings. Legacy fixed-upstream configuration is rejected.
+
 [中文文档](README.zh-CN.md)
 
 DNS-Ingress is a DNS request router that forwards queries to different upstream servers based on subdomain prefixes. For example: forwarding api.example.org to api.example.cn, and www.example.org to www.example.cn. Supports DoT, DoH, DoQ, DoH3 protocols.
@@ -29,7 +33,7 @@ DNS Ingress Server receives DNS query requests from clients, processes them thro
 
 #### 1. Startup Phase
 
-The program starts from `main.rs`, initializes the Rustls cryptographic provider, loads the configuration file (`config.toml` or defaults), validates the configuration, initializes the logging system, creates an `App` instance (including SNI Rewriter and metrics collector initialization), and finally starts servers for each protocol (DoT, DoH, DoQ, DoH3) and the health check server in parallel.
+The program starts from `main.rs`, initializes the Rustls cryptographic provider, loads the required `config.toml`, validates the configuration, initializes the logging system, creates an `App` instance (including SNI Rewriter and metrics collector initialization), and finally starts servers for each protocol (DoT, DoH, DoQ, DoH3) and the health check server.
 
 #### 2. Request Processing Flow (DoH Example)
 
@@ -95,6 +99,8 @@ When a TLS handshake request is received (SNI: www.example.org), `CertificateRes
 - Supported methods: GET, POST
 
 **DoT (DNS over TLS)**
+
+The listener and its upstream TLS client advertise the `dot` ALPN identifier.
 
 - Listening port: TCP 853
 - SNI extraction: From TLS handshake (via `ClientHello`)
@@ -282,6 +288,7 @@ port = 853
 enabled = true
 bind_address = "0.0.0.0"
 port = 443
+path = "/dns-query"
 
 # DNS over QUIC (DoQ) - UDP 853
 [servers.doq]
@@ -294,6 +301,7 @@ port = 853
 enabled = false
 bind_address = "0.0.0.0"
 port = 443
+path = "/dns-query"
 
 # Healthcheck server - HTTP endpoint for health checks
 [servers.healthcheck]
@@ -303,21 +311,28 @@ port = 8080
 path = "/health"
 
 [upstream]
-# Default upstream server
-default = "8.8.8.8:853"
-# Protocol-specific upstream servers (optional, fallback to default)
-dot = "8.8.8.8:853"
-doh = "https://dns.google/dns-query"
-doq = "8.8.8.8:853"
-doh3 = "https://dns.google/dns-query"
+[upstream.dot]
+port = 853
+[upstream.doh]
+port = 443
+path = "/dns-query"
+[upstream.doq]
+port = 853
+[upstream.doh3]
+port = 443
+path = "/dns-query"
+
+[limits]
+max_connections_per_listener = 1024
+max_inflight_requests_per_connection = 64
+max_upstream_pool_entries = 256
+transaction_timeout_seconds = 30
 
 [tls]
 # Default certificate config (optional, used when no domain-specific certificate found)
 [tls.default]
 cert_file = "/path/to/default-cert.pem"
 key_file = "/path/to/default-key.pem"
-# ca_file = "/path/to/default-ca.pem"
-require_client_cert = false
 
 # Separate certificates for each base domain
 [tls.certs.example.com]
@@ -357,10 +372,17 @@ Health check server provides:
 - `GET /metrics` or `GET /stats` - Returns Prometheus format metrics
 - `GET /metrics/json` - Returns JSON format metrics
 
-#### `[upstream]` - Upstream Server Config
+#### `[upstream]` - Upstream Endpoint Config
 
-- **`default`**: Default upstream server (fallback for all protocols)
-- **`dot`**, **`doh`**, **`doq`**, **`doh3`**: Protocol-specific upstream servers (optional)
+The rewriter supplies the upstream hostname. `dot` and `doq` configure `port`;
+`doh` and `doh3` configure `port` and `path`. Fixed upstream hosts are not supported.
+
+#### `[limits]` - Resource Limits
+
+`max_connections_per_listener` bounds every public listener. The in-flight
+limit applies to multiplexed DoH/DoQ/DoH3 request streams. The upstream pool is
+keyed by rewritten authority and protocol; DoQ and DoH3 retain QUIC sessions
+for reuse. `transaction_timeout_seconds` is a no-progress I/O timeout.
 
 #### `[tls]` - TLS Certificate Config
 
@@ -368,8 +390,6 @@ Health check server provides:
 - **`[tls.certs.<domain>]`**: Domain-specific certificate config
   - **`cert_file`**: Certificate file path (PEM format)
   - **`key_file`**: Private key file path (PEM format)
-  - **`ca_file`**: CA certificate file path (optional)
-  - **`require_client_cert`**: Whether to require client certificate (default: false)
 
 #### `[logging]` - Logging Config
 
@@ -450,8 +470,9 @@ cargo test -- --nocapture
 After starting the service, you can monitor via health check endpoints:
 
 ```bash
-# Check service health status
-curl http://localhost:8080/health
+# Check process liveness and listener readiness
+curl http://localhost:8080/live
+curl http://localhost:8080/ready
 
 # Get Prometheus format metrics
 curl http://localhost:8080/metrics
@@ -459,6 +480,11 @@ curl http://localhost:8080/metrics
 # Get JSON format metrics
 curl http://localhost:8080/metrics/json
 ```
+
+`/live` reports process liveness. `/ready` becomes successful only after every
+enabled listener has bound its production socket; it becomes unavailable again
+if an ingress task exits. `transaction_timeout_seconds` is an idle-I/O timeout,
+so streamed AXFR/IXFR responses are not capped by a total transfer duration.
 
 Metrics returned by health check endpoints include:
 

@@ -1,20 +1,18 @@
 use crate::config::RewriteConfig;
 use crate::sni::{RewriteResult, SniRewriter};
-use dashmap::DashMap;
-use std::sync::Arc;
 use tracing::{info, warn};
 
 pub struct BaseSniRewriter {
     config: RewriteConfig,
-    pub sni_map: Arc<DashMap<String, String>>,
 }
 
 impl BaseSniRewriter {
-    pub fn new(config: RewriteConfig) -> Self {
-        Self {
-            config,
-            sni_map: Arc::new(DashMap::new()),
+    pub fn new(mut config: RewriteConfig) -> Self {
+        for domain in &mut config.base_domains {
+            *domain = domain.trim_end_matches('.').to_ascii_lowercase();
         }
+        config.target_suffix = config.target_suffix.to_ascii_lowercase();
+        Self { config }
     }
 
     pub fn extract_prefix(&self, sni: &str) -> Option<String> {
@@ -61,45 +59,30 @@ impl SniRewriter for BaseSniRewriter {
             return None;
         }
 
-        // Try to extract prefix
-        let prefix = match self.extract_prefix(sni) {
+        let normalized = sni.trim_end_matches('.').to_ascii_lowercase();
+        if !normalized.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+        }) {
+            warn!("Invalid non-ASCII DNS hostname provided for rewrite");
+            return None;
+        }
+
+        // DNS hostnames are ASCII case-insensitive. Config validation keeps
+        // base domains canonical, so matching is deterministic here.
+        let prefix = match self.extract_prefix(&normalized) {
             Some(p) => p,
-            None => {
-                // Handle rewrite failure based on strategy
-                match self.config.rewrite_failure_strategy.as_str() {
-                    "passthrough" => {
-                        warn!(
-                            "SNI rewrite failed for '{}', using passthrough strategy",
-                            sni
-                        );
-                        // Return result with original hostname as target
-                        return Some(RewriteResult {
-                            original: sni.to_string(),
-                            prefix: String::new(),
-                            target_hostname: sni.to_string(),
-                        });
-                    }
-                    _ => {
-                        // Default: return None (error strategy)
-                        return None;
-                    }
-                }
-            }
+            None => return None,
         };
 
         let target_hostname = self.build_target_hostname(&prefix);
 
-        // Cache the mapping for future lookups (lock-free with DashMap)
-        self.sni_map
-            .insert(sni.to_string(), target_hostname.clone());
-
         info!(
             "SNI Rewrite: {} -> Prefix: {} -> Target: {}",
-            sni, prefix, target_hostname
+            normalized, prefix, target_hostname
         );
 
         Some(RewriteResult {
-            original: sni.to_string(),
+            original: normalized,
             prefix,
             target_hostname,
         })

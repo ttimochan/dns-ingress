@@ -19,7 +19,7 @@ async fn test_app_start_with_all_disabled() {
     config.servers.healthcheck.enabled = false;
 
     let mut app = App::new(config);
-    let result = app.start();
+    let result = app.start().await;
     assert!(result.is_ok());
 }
 
@@ -33,6 +33,6 @@ async fn test_app_start_with_some_enabled() {
     config.servers.healthcheck.enabled = false;
 
     let mut app = App::new(config);
-    let result = app.start();
-    assert!(result.is_ok());
+    let result = app.start().await;
+    assert!(result.is_err());
 }

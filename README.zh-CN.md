@@ -1,5 +1,9 @@
 # DNS Ingress
 
+> **v2 配置迁移：** 上游主机名始终由改写后的目标域名决定。请将旧的
+> `upstream.default` 与各协议固定 URL/地址替换为按协议配置的端点参数；
+> 旧固定上游配置会被拒绝。
+
 [English](README.md)
 
 DNS-Ingress 是一个 DNS 请求路由器，可以根据子域名前缀将查询转发到不同的上游服务器。例如：将 api.example.org 转发到 api.example.cn，将 www.example.org 转发到 www.example.cn。支持 DoT、DoH、DoQ、DoH3 协议。
@@ -282,6 +286,7 @@ port = 853
 enabled = true
 bind_address = "0.0.0.0"
 port = 443
+path = "/dns-query"
 
 # DNS over QUIC (DoQ) - UDP 853
 [servers.doq]
@@ -294,6 +299,7 @@ port = 853
 enabled = false
 bind_address = "0.0.0.0"
 port = 443
+path = "/dns-query"
 
 # Healthcheck server - HTTP endpoint for health checks
 [servers.healthcheck]
@@ -303,21 +309,32 @@ port = 8080
 path = "/health"
 
 [upstream]
-# 默认上游服务器
-default = "8.8.8.8:853"
-# 协议特定的上游服务器（可选，回退到 default）
-dot = "8.8.8.8:853"
-doh = "https://dns.google/dns-query"
-doq = "8.8.8.8:853"
-doh3 = "https://dns.google/dns-query"
+[upstream.dot]
+port = 853
+[upstream.doh]
+port = 443
+path = "/dns-query"
+[upstream.doq]
+port = 853
+[upstream.doh3]
+port = 443
+path = "/dns-query"
+
+[limits]
+# 每个公开 listener 的并发连接数上限
+max_connections_per_listener = 1024
+# HTTP/2、HTTP/3、DoQ 单连接并发 DNS 请求上限
+max_inflight_requests_per_connection = 64
+# 以重写后的 authority 为键的上游连接池上限
+max_upstream_pool_entries = 256
+# 单次请求无 I/O 进展的超时（持续流式 AXFR/IXFR 不受总时长限制）
+transaction_timeout_seconds = 30
 
 [tls]
 # 默认证书配置（可选，当没有找到域名特定证书时使用）
 [tls.default]
 cert_file = "/path/to/default-cert.pem"
 key_file = "/path/to/default-key.pem"
-# ca_file = "/path/to/default-ca.pem"
-require_client_cert = false
 
 # 为每个基准域名配置独立的证书
 [tls.certs.example.com]
@@ -335,6 +352,13 @@ key_file = "/path/to/example-org-key.pem"
 
 - **`base_domains`** (必需): 基准域名列表，用于匹配和提取前缀
 - **`target_suffix`** (必需): 目标域名后缀，与提取的前缀组合
+
+#### `[limits]` - 资源限制
+
+`max_connections_per_listener` 限制所有公开 listener 的连接数；in-flight
+限制适用于可多路复用的 DoH、DoQ、DoH3 请求流。上游池按重写后的
+authority 与协议建立键；DoQ 与 DoH3 会复用 QUIC 会话。
+`transaction_timeout_seconds` 是无 I/O 进展超时，不是 AXFR/IXFR 的总时长限制。
 
 #### `[servers.*]` - 服务器配置
 
@@ -357,10 +381,10 @@ key_file = "/path/to/example-org-key.pem"
 - `GET /metrics` 或 `GET /stats` - 返回 Prometheus 格式指标
 - `GET /metrics/json` - 返回 JSON 格式指标
 
-#### `[upstream]` - 上游服务器配置
+#### `[upstream]` - 上游端点配置
 
-- **`default`**: 默认上游服务器（所有协议的回退选项）
-- **`dot`**, **`doh`**, **`doq`**, **`doh3`**: 协议特定的上游服务器（可选）
+上游主机名由重写器生成；`dot`、`doq` 配置 `port`，`doh`、`doh3`
+配置 `port` 与 `path`。不再支持固定上游主机，以避免绕过域名路由。
 
 #### `[tls]` - TLS 证书配置
 
@@ -368,8 +392,6 @@ key_file = "/path/to/example-org-key.pem"
 - **`[tls.certs.<domain>]`**: 域名特定的证书配置
   - **`cert_file`**: 证书文件路径（PEM 格式）
   - **`key_file`**: 私钥文件路径（PEM 格式）
-  - **`ca_file`**: CA 证书文件路径（可选）
-  - **`require_client_cert`**: 是否要求客户端证书（默认：false）
 
 #### `[logging]` - 日志配置
 
@@ -450,7 +472,11 @@ cargo test -- --nocapture
 启动服务后，可以通过健康检查端点监控服务状态：
 
 ```bash
-# 检查服务健康状态
+# 检查进程存活和全部 listener 就绪状态
+curl http://localhost:8080/live
+curl http://localhost:8080/ready
+
+# 自定义兼容检查路径（默认 /health）
 curl http://localhost:8080/health
 
 # 获取 Prometheus 格式指标

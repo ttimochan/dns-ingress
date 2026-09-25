@@ -1,19 +1,17 @@
+use crate::proxy::http::{is_dns_message_content_type, validate_dns_message};
 use crate::upstream::pool::ConnectionPool;
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, Response, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, warn};
 
-/// Default timeout for upstream requests (30 seconds)
-const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DNS_MESSAGE_SIZE: usize = u16::MAX as usize;
 
-/// Create a new connection pool instance
-/// This is a convenience function that creates a pool with default settings
-pub fn create_connection_pool() -> Arc<ConnectionPool> {
-    Arc::new(ConnectionPool::new())
+pub fn create_connection_pool_with_limit(max_clients: usize) -> Arc<ConnectionPool> {
+    Arc::new(ConnectionPool::with_max_clients(max_clients))
 }
 
 /// Forward HTTP request to upstream server with timeout control
@@ -28,6 +26,7 @@ pub async fn forward_http_request(
     method: Method,
     headers: &hyper::HeaderMap,
     body: Bytes,
+    timeout: Duration,
 ) -> Result<(Response<Full<Bytes>>, u64)> {
     // Get or create a client for this SNI (target_hostname)
     // This ensures connection reuse for the same target
@@ -43,13 +42,12 @@ pub async fn forward_http_request(
             )
         })?;
 
-    // Copy headers efficiently - only copy necessary headers
-    // Skip headers that will be overwritten or aren't needed
-    let skip_headers = ["host", "connection", "keep-alive", "transfer-encoding"];
+    // A rewritten target is a distinct HTTP authority.  Never forward
+    // credentials, cookies, forwarding headers, or connection-specific state
+    // across that boundary; DoH only needs content negotiation metadata.
+    let allowed_headers = ["accept", "content-type"];
     for (key, value) in headers {
-        let key_str = key.as_str();
-        if !skip_headers.contains(&key_str) {
-            // Use reference to avoid cloning when possible
+        if allowed_headers.contains(&key.as_str()) {
             req.headers_mut().insert(key, value.clone());
         }
     }
@@ -69,7 +67,7 @@ pub async fn forward_http_request(
     // Add timeout control to prevent hanging requests
     // The client from the pool will reuse existing connections when possible
     let request_future = client.request(req);
-    let timeout_future = tokio::time::timeout(DEFAULT_UPSTREAM_TIMEOUT, request_future);
+    let timeout_future = tokio::time::timeout(timeout, request_future);
 
     match timeout_future.await {
         Ok(Ok(resp)) => {
@@ -81,21 +79,39 @@ pub async fn forward_http_request(
                 status, upstream_uri
             );
 
-            let body_bytes = body
-                .collect()
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to read response body from upstream: {}",
-                        upstream_uri
-                    )
-                })?
-                .to_bytes();
+            let body_bytes = tokio::time::timeout(
+                timeout,
+                Limited::new(body, MAX_DNS_MESSAGE_SIZE).collect(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Upstream response body timed out: {}", upstream_uri))?
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Upstream response exceeds the DNS message limit or could not be read: {}: {}",
+                    upstream_uri,
+                    error
+                )
+            })?
+            .to_bytes();
 
             let body_size = body_bytes.len() as u64;
             debug!("Response body size: {} bytes", body_size);
 
-            if !status.is_success() {
+            if status.is_success() {
+                let content_type = parts
+                    .headers
+                    .get(hyper::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok());
+                if !is_dns_message_content_type(content_type) {
+                    anyhow::bail!(
+                        "HTTP upstream response for {} is successful but not application/dns-message",
+                        upstream_uri
+                    );
+                }
+                validate_dns_message(&body_bytes, "HTTP upstream DNS response").with_context(
+                    || format!("HTTP upstream response for {} is malformed", upstream_uri),
+                )?;
+            } else {
                 warn!(
                     "Upstream returned non-success status: {} {} (body: {} bytes)",
                     status, upstream_uri, body_size
@@ -131,11 +147,11 @@ pub async fn forward_http_request(
         Err(_) => {
             error!(
                 "HTTP upstream request timeout: {} {} (target: {}, timeout: {:?})",
-                method, upstream_uri, target_hostname, DEFAULT_UPSTREAM_TIMEOUT
+                method, upstream_uri, target_hostname, timeout
             );
 
             // Return timeout error response
-            let error_msg = format!("Upstream timeout after {:?}", DEFAULT_UPSTREAM_TIMEOUT);
+            let error_msg = format!("Upstream timeout after {:?}", timeout);
             let error_body = Full::new(error_msg.clone().into());
             let error_size = error_msg.len() as u64;
             Response::builder()

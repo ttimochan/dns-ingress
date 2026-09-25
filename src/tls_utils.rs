@@ -1,47 +1,45 @@
 use crate::config::{AppConfig, CertificateConfig};
 use crate::error::{CertificateError, DnsProxyError, DnsProxyResult};
-use dashmap::DashMap;
 use rustls::server::{ClientHello, ResolvesServerCert, ServerConfig as RustlsServerConfig};
 use rustls::sign::CertifiedKey;
 use std::io::BufReader;
 use std::sync::Arc;
-use tokio::fs;
 
 pub struct CertificateResolver {
-    config: AppConfig,
-    pub cert_cache: Arc<DashMap<String, Arc<CertifiedKey>>>,
+    certs: std::collections::HashMap<String, Arc<CertifiedKey>>,
+    default: Option<Arc<CertifiedKey>>,
 }
 
 impl CertificateResolver {
-    pub fn new(config: AppConfig) -> Self {
-        Self {
-            config,
-            cert_cache: Arc::new(DashMap::new()),
+    /// Load every configured certificate before accepting traffic. Rustls calls
+    /// `resolve` synchronously during a handshake, so disk I/O here would
+    /// otherwise block the runtime (and used to attempt a nested runtime).
+    pub fn new(config: &AppConfig) -> DnsProxyResult<Self> {
+        let default = config
+            .tls
+            .default
+            .as_ref()
+            .map(Self::load_certificate)
+            .transpose()?;
+        let mut certs = std::collections::HashMap::new();
+        for (domain, cert_config) in &config.tls.certs {
+            certs.insert(
+                domain.to_ascii_lowercase(),
+                Self::load_certificate(cert_config)?,
+            );
         }
+        Ok(Self { certs, default })
     }
 
-    pub fn with_arc(config: Arc<AppConfig>) -> Self {
-        Self {
-            config: (*config).clone(),
-            cert_cache: Arc::new(DashMap::new()),
-        }
-    }
-
-    pub fn tls_config(&self) -> &AppConfig {
-        &self.config
-    }
-
-    pub async fn load_certificate(
-        cert_config: &CertificateConfig,
-    ) -> DnsProxyResult<Arc<CertifiedKey>> {
-        let cert_bytes = fs::read(&cert_config.cert_file).await.map_err(|e| {
+    pub fn load_certificate(cert_config: &CertificateConfig) -> DnsProxyResult<Arc<CertifiedKey>> {
+        let cert_bytes = std::fs::read(&cert_config.cert_file).map_err(|e| {
             DnsProxyError::Certificate(CertificateError::LoadFailed {
                 path: cert_config.cert_file.clone(),
                 reason: format!("Failed to read: {}", e),
             })
         })?;
 
-        let key_bytes = fs::read(&cert_config.key_file).await.map_err(|e| {
+        let key_bytes = std::fs::read(&cert_config.key_file).map_err(|e| {
             DnsProxyError::Certificate(CertificateError::LoadFailed {
                 path: cert_config.key_file.clone(),
                 reason: format!("Failed to read: {}", e),
@@ -95,35 +93,28 @@ impl CertificateResolver {
         Ok(Arc::new(certified_key))
     }
 
-    pub async fn get_cert_for_domain(&self, domain: &str) -> DnsProxyResult<Arc<CertifiedKey>> {
-        // Check cache first (fast path, lock-free with DashMap)
-        if let Some(cert) = self.cert_cache.get(domain) {
-            return Ok(Arc::clone(cert.value()));
+    pub fn get_cert_for_domain(&self, domain: &str) -> DnsProxyResult<Arc<CertifiedKey>> {
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(cert) = self.certs.get(&domain) {
+            return Ok(Arc::clone(cert));
         }
-
-        // Load certificate from configuration
-        let cert_config = self
-            .config
-            .tls
-            .get_cert_config_or_err(domain)
-            .map_err(|_e| {
-                DnsProxyError::Certificate(CertificateError::NotConfigured {
-                    domain: domain.to_string(),
-                })
-            })?;
-
-        let cert = Self::load_certificate(cert_config).await.map_err(|e| {
-            DnsProxyError::Certificate(CertificateError::LoadFailed {
-                path: cert_config.cert_file.clone(),
-                reason: format!("Failed to load for domain {}: {}", domain, e),
+        // A configured base-domain certificate applies to its subdomains. Pick
+        // the longest suffix so overlapping bases remain deterministic.
+        if let Some((_, cert)) = self
+            .certs
+            .iter()
+            .filter(|(base, _)| {
+                domain.ends_with(base.as_str())
+                    && domain.len() > base.len()
+                    && domain.as_bytes()[domain.len() - base.len() - 1] == b'.'
             })
-        })?;
-
-        // Update cache (lock-free)
-        self.cert_cache
-            .insert(domain.to_string(), Arc::clone(&cert));
-
-        Ok(cert)
+            .max_by_key(|(base, _)| base.len())
+        {
+            return Ok(Arc::clone(cert));
+        }
+        self.default.clone().ok_or(DnsProxyError::Certificate(
+            CertificateError::NotConfigured { domain },
+        ))
     }
 }
 
@@ -153,35 +144,22 @@ impl ResolvesServerCert for DynamicCertResolver {
             }
         };
 
-        let resolver = self.resolver.clone();
         let sni_str = sni.to_string();
 
         tracing::debug!("Resolving certificate for SNI: {}", sni_str);
 
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            match handle.block_on(resolver.get_cert_for_domain(&sni_str)) {
-                Ok(cert) => {
-                    tracing::debug!("Successfully loaded certificate for SNI: {}", sni_str);
-                    Some(cert)
-                }
-                Err(e) => {
-                    tracing::error!("Failed to load certificate for SNI {}: {}", sni_str, e);
-                    None
-                }
+        match self.resolver.get_cert_for_domain(&sni_str) {
+            Ok(cert) => Some(cert),
+            Err(e) => {
+                tracing::error!("No certificate for SNI {}: {}", sni_str, e);
+                None
             }
-        } else {
-            tracing::error!(
-                "No tokio runtime available for certificate loading (SNI: {})",
-                sni_str
-            );
-            None
         }
     }
 }
 
 pub async fn create_server_config(config: &AppConfig) -> DnsProxyResult<RustlsServerConfig> {
-    let resolver = Arc::new(CertificateResolver::new(config.clone()));
+    let resolver = Arc::new(CertificateResolver::new(config)?);
     let cert_resolver = Arc::new(DynamicCertResolver::new(resolver));
 
     Ok(RustlsServerConfig::builder()

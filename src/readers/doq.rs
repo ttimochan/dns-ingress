@@ -1,29 +1,46 @@
 use crate::config::AppConfig;
 use crate::error::DnsProxyResult;
 use crate::metrics::{Metrics, Timer};
-use crate::quic::create_quic_server_endpoint;
+use crate::quic::{QuicApplication, create_quic_server_endpoint};
 use crate::rewrite::SniRewriterType;
+use crate::upstream::QuicConnectionPool;
 use crate::upstream::forward_quic_stream;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 pub struct DoQServer {
     config: Arc<AppConfig>,
     rewriter: SniRewriterType,
     metrics: Arc<Metrics>,
+    pool: Arc<QuicConnectionPool>,
 }
 
 impl DoQServer {
     pub fn new(config: Arc<AppConfig>, rewriter: SniRewriterType, metrics: Arc<Metrics>) -> Self {
         Self {
+            pool: Arc::new(QuicConnectionPool::new(
+                config.limits.max_upstream_pool_entries,
+            )),
             config,
             rewriter,
             metrics,
         }
     }
 
+    #[allow(dead_code)]
     pub async fn start(&self) -> DnsProxyResult<()> {
+        self.run(CancellationToken::new(), None).await
+    }
+
+    pub async fn run(
+        &self,
+        shutdown: CancellationToken,
+        ready: Option<oneshot::Sender<DnsProxyResult<()>>>,
+    ) -> DnsProxyResult<()> {
         let server_config = &self.config.servers.doq;
         if !server_config.enabled {
             info!("DoQ server is disabled");
@@ -35,32 +52,66 @@ impl DoQServer {
             crate::error::DnsProxyError::InvalidInput(format!("Invalid bind address: {}", e))
         })?;
 
-        let endpoint = create_quic_server_endpoint(self.config.as_ref(), addr).await?;
+        let endpoint =
+            match create_quic_server_endpoint(self.config.as_ref(), addr, QuicApplication::Doq)
+                .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    if let Some(sender) = ready {
+                        let _ = sender.send(Err(crate::error::DnsProxyError::Protocol(
+                            error.to_string(),
+                        )));
+                    }
+                    return Err(error.into());
+                }
+            };
         info!("DoQ server listening on UDP {}", addr);
 
-        let upstream = self
-            .config
-            .doq_upstream()
-            .map_err(|e| crate::error::DnsProxyError::Config(e.to_string()))?;
-        let upstream_hostname = self.config.dot_upstream_hostname(); // Reuse the same method
         let rewriter = Arc::clone(&self.rewriter);
+        let upstream_port = self.config.upstream.doq.port;
+        let max_streams = self.config.limits.max_inflight_requests_per_connection;
+        let transaction_timeout =
+            std::time::Duration::from_secs(self.config.limits.transaction_timeout_seconds);
+        let connection_limit = Arc::new(Semaphore::new(
+            self.config.limits.max_connections_per_listener,
+        ));
 
         let metrics = Arc::clone(&self.metrics);
-        while let Some(conn) = endpoint.accept().await {
+        let pool = Arc::clone(&self.pool);
+        if let Some(sender) = ready {
+            let _ = sender.send(Ok(()));
+        }
+        loop {
+            let conn = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                conn = endpoint.accept() => conn,
+            };
+            let Some(conn) = conn else { break };
+            let permit = Arc::clone(&connection_limit)
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    crate::error::DnsProxyError::Protocol("DoQ listener stopped".into())
+                })?;
             let rewriter = Arc::clone(&rewriter);
-            let upstream_addr = upstream;
-            let upstream_host = upstream_hostname.clone();
             let m = Arc::clone(&metrics);
+            let pool = Arc::clone(&pool);
+            let connection_shutdown = shutdown.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 match conn.await {
                     Ok(connection) => {
                         info!("New DoQ connection from {}", connection.remote_address());
                         let remote_addr = connection.remote_address();
                         if let Err(e) = Self::handle_connection(
                             connection,
-                            upstream_addr,
                             rewriter,
-                            &upstream_host,
+                            upstream_port,
+                            max_streams,
+                            transaction_timeout,
+                            connection_shutdown.clone(),
+                            pool,
                             m,
                         )
                         .await
@@ -83,47 +134,107 @@ impl DoQServer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // per-connection runtime dependencies are explicit
     async fn handle_connection(
         connection: quinn::Connection,
-        upstream: SocketAddr,
-        _rewriter: SniRewriterType,
-        upstream_hostname: &str,
+        rewriter: SniRewriterType,
+        upstream_port: u16,
+        max_streams: usize,
+        transaction_timeout: std::time::Duration,
+        shutdown: CancellationToken,
+        pool: Arc<QuicConnectionPool>,
         metrics: Arc<Metrics>,
     ) -> DnsProxyResult<()> {
+        let handshake = connection.handshake_data().ok_or_else(|| {
+            crate::error::DnsProxyError::InvalidInput("DoQ requires TLS SNI hostname".to_string())
+        })?;
+        let source_hostname = handshake
+            .downcast::<quinn::crypto::rustls::HandshakeData>()
+            .ok()
+            .and_then(|data| data.server_name.clone())
+            .ok_or({
+                crate::error::DnsProxyError::InvalidInput(
+                    "DoQ requires TLS SNI hostname".to_string(),
+                )
+            })?;
+        let target = crate::sni::SniRewriter::rewrite(&*rewriter, &source_hostname)
+            .await
+            .ok_or({
+                crate::error::DnsProxyError::SniRewrite(
+                    crate::error::SniRewriteError::NoMatchingBaseDomain {
+                        hostname: source_hostname,
+                    },
+                )
+            })?
+            .target_hostname;
+
+        let unidirectional = connection.clone();
+        let uni_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let accepted = tokio::select! {
+                _ = uni_shutdown.cancelled() => return,
+                accepted = unidirectional.accept_uni() => accepted,
+            };
+            if accepted.is_ok() {
+                unidirectional.close(quinn::VarInt::from_u32(0x2), b"DoQ unidirectional stream");
+            }
+        });
+
+        let stream_limit = Arc::new(Semaphore::new(max_streams));
         loop {
-            let timer = Timer::start();
-            match connection.accept_bi().await {
+            let accepted = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                accepted = connection.accept_bi() => accepted,
+            };
+            match accepted {
                 Ok((send, recv)) => {
-                    // Forward stream using zerocopy where possible
-                    let result = forward_quic_stream(send, recv, upstream, upstream_hostname).await;
-                    let duration = timer.elapsed();
-
-                    // Estimate bytes (QUIC streams don't easily expose byte counts)
-                    // We'll use a reasonable estimate based on typical DNS message sizes
-                    let estimated_bytes = 512u64; // Typical DNS query/response size
-
-                    match result {
-                        Ok(_) => {
-                            tracing::debug!(
-                                "DoQ stream forwarded successfully to {} (SNI: {})",
-                                upstream,
-                                upstream_hostname
-                            );
-                            metrics.record_request(
+                    let permit = Arc::clone(&stream_limit)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            crate::error::DnsProxyError::Protocol("DoQ connection stopped".into())
+                        })?;
+                    let target = target.clone();
+                    let metrics = Arc::clone(&metrics);
+                    let close_connection = connection.clone();
+                    let shutdown = shutdown.clone();
+                    let pool = Arc::clone(&pool);
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let timer = Timer::start();
+                        let forwarding = forward_quic_stream(
+                            send,
+                            recv,
+                            &target,
+                            upstream_port,
+                            &pool,
+                            transaction_timeout,
+                        );
+                        let result = tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            result = forwarding => result,
+                        };
+                        match result {
+                            Ok((bytes_received, bytes_sent)) => metrics.record_request(
                                 true,
-                                estimated_bytes,
-                                estimated_bytes,
-                                duration,
-                            );
+                                bytes_received,
+                                bytes_sent,
+                                timer.elapsed(),
+                            ),
+                            Err(error) => {
+                                error!(
+                                    "DoQ stream forwarding error to upstream {}:{}: {}",
+                                    target, upstream_port, error
+                                );
+                                metrics.record_request(false, 0, 0, timer.elapsed());
+                                metrics.record_upstream_error();
+                                if matches!(error, crate::error::DnsProxyError::Protocol(_)) {
+                                    close_connection
+                                        .close(quinn::VarInt::from_u32(0x2), b"DoQ protocol error");
+                                }
+                            }
                         }
-                        Err(e) => {
-                            error!(
-                                "DoQ stream forwarding error to upstream {} (SNI: {}): {}",
-                                upstream, upstream_hostname, e
-                            );
-                            metrics.record_request(false, estimated_bytes, 0, duration);
-                        }
-                    }
+                    });
                 }
                 Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
                     info!("DoQ connection closed");

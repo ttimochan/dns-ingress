@@ -22,6 +22,7 @@ port = 853
 enabled = true
 bind_address = "0.0.0.0"
 port = 443
+path = "/dns-query"
 
 # DNS over QUIC (DoQ) - UDP 853
 [servers.doq]
@@ -34,6 +35,7 @@ port = 853
 enabled = false
 bind_address = "0.0.0.0"
 port = 443
+path = "/dns-query"
 
 # Healthcheck server - HTTP endpoint for health checks
 [servers.healthcheck]
@@ -43,13 +45,28 @@ port = 8080
 path = "/health"
 
 [upstream]
-# Default upstream server
-default = "8.8.8.8:853"
-# Protocol-specific upstream servers (optional, falls back to default)
-dot = "8.8.8.8:853"
-doh = "https://dns.google/dns-query"
-doq = "8.8.8.8:853"
-doh3 = "https://dns.google/dns-query"
+# The hostname is always the rewritten target, e.g. api.example.cn.
+# Configure only endpoint details; fixed upstream hosts are intentionally not
+# supported because they bypass domain routing.
+[upstream.dot]
+port = 853
+
+[upstream.doh]
+port = 443
+path = "/dns-query"
+
+[upstream.doq]
+port = 853
+
+[upstream.doh3]
+port = 443
+path = "/dns-query"
+
+[limits]
+max_connections_per_listener = 1024
+max_inflight_requests_per_connection = 64
+max_upstream_pool_entries = 256
+transaction_timeout_seconds = 30
 
 [tls]
 # Default certificate configuration (optional)
@@ -57,22 +74,16 @@ doh3 = "https://dns.google/dns-query"
 [tls.default]
 cert_file = "/path/to/default-cert.pem"
 key_file = "/path/to/default-key.pem"
-# ca_file = "/path/to/default-ca.pem"
-require_client_cert = false
 
 # Domain-specific certificate configurations
 # Each base domain can have its own certificate files
 [tls.certs.example.com]
 cert_file = "/path/to/example-com-cert.pem"
 key_file = "/path/to/example-com-key.pem"
-# ca_file = "/path/to/example-com-ca.pem"
-require_client_cert = false
 
 [tls.certs.example.org]
 cert_file = "/path/to/example-org-cert.pem"
 key_file = "/path/to/example-org-key.pem"
-# ca_file = "/path/to/example-org-ca.pem"
-require_client_cert = false
 
 [logging]
 # Log level: trace, debug, info, warn, error (default: info)
@@ -88,4 +99,3 @@ level = "info"
 # max_file_size = 10485760
 # Number of log files to keep (default: 5)
 # max_files = 5
-
